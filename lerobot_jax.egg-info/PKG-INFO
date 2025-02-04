@@ -1,0 +1,23 @@
+Metadata-Version: 2.1
+Name: lerobot-jax
+Version: 0.1.0
+Summary: A JAX-based library for multi-task experts training using diffusion and TDMPC2.
+Author: Your Name
+Author-email: your.email@example.com
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Dist: jax
+Requires-Dist: jaxlib
+Requires-Dist: flax
+Requires-Dist: ml-collections
+Requires-Dist: numpy
+Requires-Dist: diffusers
+Requires-Dist: optax
+Requires-Dist: absl-py
+Requires-Dist: wandb
+Requires-Dist: torch
+Requires-Dist: tqdm
+Requires-Dist: hydra-core
+Requires-Dist: omegaconf
+Requires-Dist: deepdiff
+Requires-Dist: termcolor

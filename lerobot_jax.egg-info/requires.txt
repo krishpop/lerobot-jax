@@ -1,0 +1,15 @@
+jax
+jaxlib
+flax
+ml-collections
+numpy
+diffusers
+optax
+absl-py
+wandb
+torch
+tqdm
+hydra-core
+omegaconf
+deepdiff
+termcolor
