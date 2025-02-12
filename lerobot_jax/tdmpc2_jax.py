@@ -261,6 +261,12 @@ def collect_metrics(metrics, names, prefix=None):
 
 
 
+@dataclass
+class AgentEvalState:
+    observation_queue: collections.deque = struct.field(default_factory=lambda: collections.deque(maxlen=1))
+    action_queue: collections.deque = struct.field(default_factory=lambda: collections.deque(maxlen=5))
+
+
 # ----------------------------------------------------------------------------------------
 # TDMPC2 main logic
 # ----------------------------------------------------------------------------------------
@@ -268,26 +274,56 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
     rng: jax.random.PRNGKey
     model: WorldModel
     cfg: TDMPC2Config
-    _queues: dict = None  # Will be initialized in reset()
-    _prev_mean: Optional[jnp.ndarray] = None
+    eval_state: Optional[AgentEvalState] = None
     _use_image: bool = False
     _use_env_state: bool = False
     input_image_key: Optional[str] = None
 
-    def reset(self):
-        """Clear observation and action queues. Clear previous means for warm starting."""
-        self._queues = {
+    def init_eval_state(self) -> 'TDMPC2Agent':
+        """Initialize evaluation state with empty queues."""
+        queues = {
             "observation.state": collections.deque(maxlen=1),
             "action": collections.deque(maxlen=max(
                 self.cfg.n_action_steps, self.cfg.n_action_repeats
             )),
         }
         if self._use_image:
-            self._queues["observation.image"] = collections.deque(maxlen=1)
+            queues["observation.image"] = collections.deque(maxlen=1)
         if self._use_env_state:
-            self._queues["observation.environment_state"] = collections.deque(maxlen=1)
-        # Previous mean obtained from planning, used to warm start next planning step
-        self._prev_mean = None
+            queues["observation.environment_state"] = collections.deque(maxlen=1)
+            
+        return self.replace(
+            eval_state=AgentEvalState(
+                observation_queue=queues["observation.state"],
+                action_queue=queues["action"]
+            )
+        )
+
+    def update_eval_state(
+        self,
+        observations: Optional[Dict[str, jnp.ndarray]] = None,
+        actions: Optional[jnp.ndarray] = None,
+    ) -> 'TDMPC2Agent':
+        """Update observation and action queues in eval state."""
+        if self.eval_state is None:
+            self = self.init_eval_state()
+        
+        new_state = self.eval_state
+        
+        if observations is not None:
+            queue = new_state.observation_queue
+            queue.append(observations)
+            new_state = self.eval_state.replace(observation_queue=queue)
+            
+        if actions is not None:
+            queue = new_state.action_queue
+            if isinstance(actions, list):
+                queue.extend(actions)
+            else:
+                queue.append(actions)
+            new_state = self.eval_state.replace(action_queue=queue)
+            
+        return self.replace(eval_state=new_state)
 
     def normalize_inputs(self, batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
         """
@@ -391,13 +427,13 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             batch["observation.image"] = batch[agent.input_image_key]
 
         # Update queues with new observations
-        agent._queues = agent.populate_queues(agent._queues, batch)
+        agent = agent.update_eval_state(observations=batch)
 
         # When action queue is depleted, populate it by querying policy
-        if len(agent._queues["action"]) == 0:
+        if len(agent.eval_state.action_queue) == 0:
             # Stack queue contents
             batch = {
-                key: jnp.stack(list(agent._queues[key]), axis=1) 
+                key: jnp.stack(list(agent.eval_state.observation_queue[key]), axis=1) 
                 for key in batch
             }
 
@@ -433,15 +469,15 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
 
             # Handle action repeats
             if agent.cfg.n_action_repeats > 1:
-                for _ in range(agent.cfg.n_action_repeats):
-                    agent._queues["action"].append(actions[0])
+                agent = agent.update_eval_state(actions=[actions[0]] * agent.cfg.n_action_repeats)
+
             else:
                 # Extend action queue with planned actions
                 for act in actions[:agent.cfg.n_action_steps]:
-                    agent._queues["action"].append(act)
+                    agent.eval_state.action_queue.append(act)
 
         # Return next action from queue
-        return agent._queues["action"].popleft()
+        return agent.eval_state.action_queue.popleft()
 
     def encode(self, obs: jnp.ndarray) -> jnp.ndarray:
         return self.model_def.apply(self._state.params, obs, method=WorldModel.encode)
@@ -901,7 +937,7 @@ def create_tdmpc2_learner(
     )
     
     # Initialize queues
-    agent.reset()
+    agent = agent.init_eval_state()
     
     return agent
 
