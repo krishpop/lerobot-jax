@@ -11,6 +11,7 @@ from jax.tree_util import tree_map
 from flax.core import frozen_dict
 from jaxrl_m.wandb import setup_wandb, default_wandb_config, get_flag_dict
 from jaxrl_m.evaluation import evaluate
+from jaxrl_m.typing import *
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.datasets.factory import make_dataset
 from lerobot.common.envs.factory import make_env
@@ -35,6 +36,7 @@ from flax.training import checkpoints
 from scalax.sharding import MeshShardingHelper, PartitionSpec, FSDPShardingRule
 from ml_collections import ConfigDict
 from dataclasses import asdict
+from diffusers import FlaxDDIMScheduler
 
 
 FLAGS = flags.FLAGS
@@ -181,7 +183,8 @@ def main(_):
         pin_memory=True,
         num_workers=FLAGS.num_workers
     )
-    sample_batch = next(iter(train_loader))
+    batch = next(iter(train_loader))
+    sample_batch = tree_map(lambda tensor: tensor.numpy(), {k: batch[k] for k in filter_keys})
     train_iter = cycle(train_loader)
 
     def get_batch(train_iter):
@@ -190,8 +193,12 @@ def main(_):
         return batch
 
     # Initialize agent based on selected algorithm
+    input_keys = tuple(input_shapes.keys())
+    assert len(output_shapes) == 1, "Only one output shape is supported"
+    output_key = list(output_shapes.keys())[0]
     rng = jax.random.PRNGKey(FLAGS.seed)
     if FLAGS.algo == 'tdmpc2':
+        from lerobot_jax.tdmpc2_jax import update_fn, sample_actions
         # Update config with shapes from environment
         config.update({
             'input_shapes': input_shapes,
@@ -201,38 +208,7 @@ def main(_):
         })
         agent = create_tdmpc2_learner(config, rng, dataset)
 
-        def update_fn(agent, batch):
-            # Convert batch to expected format
-            obs = {k: batch[k][:, 0] for k in input_shapes}
-            next_obs = {k.replace('observation', 'next.observation'): batch[k][:, 1] 
-                        for k in input_shapes if k.startswith('observation')}
-            actions = batch['action']
-            rewards = batch['next.reward']
-            
-            # Update step
-            new_agent, info = agent.update(
-                obs=obs,
-                next_obs=next_obs,
-                actions=actions,
-                rewards=rewards,
-                rng=agent.rng
-            )
-            return new_agent, info
-
-        def sample_actions(obs_dict, rng):
-            """Policy function for evaluation with TDMPC2."""
-            # Reset queues if needed (at episode start)
-            if agent._queues is None or len(agent._queues["action"]) == 0:
-                agent.reset()
-            
-            # Select action using the agent's select_action method
-            action = agent.sample_actions(obs_dict)
-            return action
-
     elif FLAGS.algo == 'diffusion':
-        input_keys = tuple(input_shapes.keys())
-        assert len(output_shapes) == 1, "Only one output shape is supported"
-        output_key = list(output_shapes.keys())[0]
         encoder_def = create_input_encoder(input_keys)
         shape_meta = {
             "batch_size": FLAGS.batch_size,
@@ -252,13 +228,17 @@ def main(_):
     else:
         raise ValueError(f"Unsupported algorithm: {FLAGS.algo}")
 
+    output_shape = tuple(sample_batch[output_key].shape)
     # Apply multi-device sharding if needed
     if FLAGS.num_devices > 1:
         mesh = MeshShardingHelper([FLAGS.num_devices], ['fsdp'])
-        update_fn = mesh.sjit(update_fn)
 
+        update_fn = functools.partial(mesh.sjit, static_argnums=(2,))(update_fn)
+        sample_actions = mesh.sjit(functools.partial(sample_actions, output_shape=output_shape))
+
+    policy_fn = lambda x: np.array(sample_actions(x))  # noqa: E731
     # Training loop
-    for i in tqdm.tqdm(range(0, FLAGS.max_steps), smoothing=0.1, dynamic_ncols=True):
+    for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
 
         # Get next batch (with restart if needed)
         try:
@@ -268,10 +248,11 @@ def main(_):
             batch = get_batch(train_iter)
 
         # Update step
-        agent, metrics = update_fn(agent, batch)
+        target = batch[output_key]
+        agent, metrics = update_fn(batch, target, output_shape)
 
         if i % FLAGS.eval_interval == 0:
-            eval_info = evaluate(sample_actions, env, num_episodes=FLAGS.eval_episodes)
+            eval_info = evaluate(policy_fn, env, num_episodes=FLAGS.eval_episodes)
             eval_metrics = {f'evaluation/{k}': v for k, v in eval_info.items()}
             wandb.log(eval_metrics, step=i)
 

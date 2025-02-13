@@ -1,5 +1,3 @@
-from .model_utils import MLP 
-
 import collections
 import os
 import pickle
@@ -17,6 +15,7 @@ import optax
 import tqdm
 import wandb
 from absl import app, flags
+from flax import struct
 from flax.training import checkpoints
 from jaxrl_m.common import TrainState, target_update
 from jaxrl_m.evaluation import evaluate
@@ -26,6 +25,8 @@ from jaxrl_m.vision.preprocess import PreprocessEncoder
 from jaxrl_m.vision.tdmpc2_simple_conv import TDMPC2SimpleConv
 from jaxrl_m.wandb import default_wandb_config, get_flag_dict, setup_wandb
 from ml_collections import ConfigDict, config_flags
+
+from .model_utils import MLP
 
 # -------------
 # Config class 
@@ -898,6 +899,36 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         self._state = new_state
         return metrics
     
+
+def update_fn(agent, batch, **kwargs):
+    # Convert batch to expected format
+    obs = {k: batch[k][:, 0] for k in input_shapes}
+    next_obs = {k.replace('observation', 'next.observation'): batch[k][:, 1] 
+                for k in input_shapes if k.startswith('observation')}
+    actions = batch['action']
+    rewards = batch['next.reward']
+    
+    # Update step
+    new_agent, info = agent.update(
+        obs=obs,
+        next_obs=next_obs,
+        actions=actions,
+        rewards=rewards,
+        rng=agent.rng
+    )
+    return new_agent, info
+
+
+def sample_actions(obs_dict, rng):
+    """Policy function for evaluation with TDMPC2."""
+    # Reset queues if needed (at episode start)
+    if agent.eval_state is None or len(agent.eval_state.action_queue) == 0:
+        agent = agent.init_eval_state()
+    
+    # Select action using the agent's select_action method
+    action = agent.sample_actions(obs_dict)
+    return action
+
 
 def create_tdmpc2_learner(
     config: ConfigDict,

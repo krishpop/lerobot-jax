@@ -25,6 +25,7 @@ import ml_collections
 from collections import deque
 
 from diffusers import FlaxDDIMScheduler
+from diffusers.schedulers.scheduling_ddim_flax import DDIMSchedulerState
 from optax.schedules import Schedule
 
 
@@ -92,7 +93,7 @@ DEFAULT_SCHEDULER_CONFIG ={
     'num_train_timesteps': 100,   # Total number of diffusion steps
     
     # Noise schedule parameters
-    'beta_schedule': "squaredcos_cap_v2",  # Type of beta schedule
+    # 'beta_schedule': "squaredcos_cap_v2",  # Type of beta schedule
     'beta_start': 0.00005,             # Starting noise level
     'beta_end': 0.02,                 # Ending noise level
     
@@ -102,7 +103,7 @@ DEFAULT_SCHEDULER_CONFIG ={
     'steps_offset': 1,                # Offset for number of inference steps
     
     # Training settings
-    'prediction_type': "epsilon",      # Whether to predict noise ("epsilon") or denoised sample ("sample")
+    # 'prediction_type': "epsilon",      # Whether to predict noise ("epsilon") or denoised sample ("sample")
 }
 
 
@@ -335,6 +336,14 @@ class ConditionalResBlock1D(nn.Module):
         return x + h
 
 
+@struct.dataclass
+class AgentEvalState:
+    """State maintained during evaluation."""
+    from collections import deque
+
+    observation_queue: deque = struct.field(default_factory=lambda: deque(maxlen=2))
+    action_queue: deque = struct.field(default_factory=lambda: deque(maxlen=8))
+
 
 class SimpleDiffusionAgent(flax.struct.PyTreeNode):
     """
@@ -343,19 +352,24 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
     """
     rng: PRNGKey
     model: TrainState
-    num_train_timesteps: int = 100
-    scheduler: FlaxDDIMScheduler = None
     scheduler_params: FrozenDict = None
     num_obs_steps: int = 2
     num_action_steps: int = 8
     horizon: int = 16
     shape_meta: FrozenDict = None
-    output_key: str = None
+    # output_key: str = None
     num_inference_steps: int = 100
-    observation_queue: deque = deque(maxlen=num_obs_steps)
-    action_queue: deque = deque(maxlen=num_action_steps)
+    eval_state: Optional[AgentEvalState] = None
 
-    def add_noise(self, actions: jnp.ndarray, noise: jnp.ndarray, timesteps: jnp.ndarray) -> jnp.ndarray:
+    # observation_queue: deque = deque(maxlen=num_obs_steps)
+    # action_queue: deque = deque(maxlen=num_action_steps)
+
+    def add_noise(
+            self,
+            actions: jnp.ndarray,
+            noise: jnp.ndarray,
+            timesteps: jnp.ndarray,
+        ) -> jnp.ndarray:
         """
         Adds noise to actions based on the scheduler's configuration and timesteps.
 
@@ -368,24 +382,39 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
         Returns:
             jnp.ndarray: Noisy actions.
         """
-        # Example implementation (modify based on your actual scheduler's logic)
-        scheduler_state = self.scheduler.create_state()
-        return self.scheduler.add_noise(
+        scheduler = FlaxDDIMScheduler(
+            prediction_type="epsilon",
+            beta_schedule="squaredcos_cap_v2", 
+            **self.scheduler_params
+        )
+        scheduler_state = scheduler.create_state()
+        return scheduler.add_noise(
             scheduler_state, 
             actions, 
             noise, 
             timesteps
         )
 
-    def update(agent, batch: Batch):
+    def init_eval_state(self) -> 'SimpleDiffusionAgent':
+        """Initialize evaluation state with empty queues."""
+        return self.replace(
+            eval_state=AgentEvalState(
+                observation_queue=deque(maxlen=self.num_obs_steps), 
+                action_queue=deque(maxlen=self.num_action_steps)
+            )
+        )
+
+    def update(self, batch: Batch, target: Data, output_shape: Tuple[int, ...]):
         """A single gradient update step."""
-        rng = jax.random.PRNGKey(agent.model.step)
+        rng = jax.random.PRNGKey(self.model.step)
+        # scheduler_state = scheduler.create_state()
 
         def loss_fn(params):
-            noise = jax.random.normal(rng, batch[agent.output_key].shape)
-            timesteps = jax.random.randint(rng, (batch[agent.output_key].shape[0],), 0, 100)
-            noisy_actions = agent.add_noise(batch[agent.output_key], noise, timesteps)
-            pred = agent.model(
+            noise = jax.random.normal(rng, output_shape)
+            timesteps = jax.random.randint(rng, (output_shape[0],), 0, 100)
+            noisy_actions = self.add_noise(target, noise, timesteps)
+            # noisy_actions = agent.add_noise(scheduler, scheduler_state, target, noise, timesteps)
+            pred = self.model(
                 batch,
                 x=noisy_actions,
                 timesteps=timesteps,
@@ -393,194 +422,102 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
                 params=params
             )
 
-            target = batch[agent.output_key]
             l2_loss = jnp.mean((pred - target)**2)
             return l2_loss, {'diffusion_loss': l2_loss}
 
-        new_model, info = agent.model.apply_loss_fn(loss_fn=loss_fn, has_aux=True)
-        return agent.replace(model=new_model), info
+        new_model, info = self.model.apply_loss_fn(loss_fn=loss_fn, has_aux=True)
+        return self.replace(model=new_model), info
 
-    def reset_state(self):
-        self.observation_queue.clear()
-        self.action_queue.clear()
+    def update_eval_state(
+        self,
+        observations: Optional[Dict[str, np.ndarray]] = None,
+        actions: Optional[np.ndarray] = None,
+    ) -> 'SimpleDiffusionAgent':
+        """Update observation and action queues in eval state."""
+        if self.eval_state is None:
+            self = self.init_eval_state()
+        
+        new_state = self.eval_state
+        
+        if observations is not None:
+            queue = new_state.observation_queue
+            queue.append(observations)
+            
+            # Pad queue with first observation if not full
+            if len(queue) < self.num_obs_steps:
+                while len(queue) < self.num_obs_steps:
+                    queue.append(observations)
+                
+            new_state = self.eval_state.replace(observation_queue=queue)
+            
+        if actions is not None:
+            queue = new_state.action_queue
+            queue.extend(actions)
+            
+            # Pad queue with first action if not full
+            if len(queue) < self.num_action_steps:
+                first_action = queue[-1]
+                while len(queue) < self.num_action_steps:
+                    queue.extend(first_action)
+                    
+            new_state = self.eval_state.replace(action_queue=queue)
+        return self.replace(eval_state=new_state)
 
-    def populate_observation_queue(self, batch: Batch):
-        if self.observation_queue is None:
-            self.reset_state()
-
-        inserted = False
-        while not inserted and len(self.observation_queue) < self.num_obs_steps:
-            self.observation_queue.append(batch)
-            inserted = True
-
-    def populate_action_queue(self, actions: jnp.ndarray):
-        if self.action_queue is None:
-            self.reset_state()
-
-        inserted = False
-        while not inserted and len(self.action_queue) < self.num_action_steps:
-            self.action_queue.append(actions)
-
-    def sample_actions(agent,
-            observations: Dict[str, np.ndarray],
-            *,
-            seed: PRNGKey = None
-        ) -> jnp.ndarray:
-        rng = jax.random.PRNGKey(seed) if seed is not None else agent.rng
-        bsz = observations[list(agent.shape_meta["input_shapes"].keys())[0]].shape[0]
-        agent.populate_observation_queue(observations)
+    def sample_actions(
+        self,
+        observations: Dict[str, np.ndarray],
+        *,
+        output_shape: Tuple[int, ...],
+        seed: PRNGKey = None
+    ) -> jnp.ndarray:
+        """Sample actions using the diffusion model."""
+        rng = jax.random.PRNGKey(seed) if seed is not None else self.rng
+        bsz = observations[list(self.shape_meta["input_shapes"].keys())[0]].shape[0]
+        
+        # Update observation queue in eval state
+        self = self.update_eval_state(observations=observations)
 
         obs_batch = {
-            key: jnp.stack([obs[key] for obs in agent.observation_queue], axis=1)
+            key: jnp.stack([obs[key] for obs in self.eval_state.observation_queue], axis=1)
             for key in observations.keys()
         }
-        sample = jax.random.normal(rng, (bsz, agent.num_action_steps, agent.shape_meta["output_shape"][agent.output_key][0]))
-        noise_scheduler = agent.scheduler
-        scheduler_state = noise_scheduler.create_state()
-        noise_scheduler.set_timesteps(scheduler_state, agent.num_inference_steps)
+        
+        # Initialize noise
+        sample = jax.random.normal(
+            rng,
+            (bsz, *output_shape[1:])
+        )
+        
+        # Setup scheduler
+        scheduler = FlaxDDIMScheduler(
+            prediction_type="epsilon",
+            beta_schedule="squaredcos_cap_v2",
+            **self.scheduler_params
+        )
+        scheduler_state = scheduler.create_state()
+        scheduler_state = scheduler.set_timesteps(scheduler_state, self.num_inference_steps)
 
-        # Example: we pick timesteps=0
+        # Denoise sample
         for t in scheduler_state.timesteps:
             timesteps = jnp.full((bsz,), t)
-            pred = agent.model(
-                obs_batch, x=sample, timesteps=timesteps, train=False
+            pred = self.model(
+                obs_batch,
+                x=sample,
+                timesteps=timesteps,
+                train=False
             )
-            pred = noise_scheduler.step(scheduler_state, sample, t, pred).prev_sample
+            sample = scheduler.step(
+                scheduler_state,
+                sample,
+                t,
+                pred
+            ).prev_sample
 
-        agent.populate_action_queue(pred)
-        return pred
-
-
-def create_input_encoder(
-    input_keys: Tuple[str, ...],
-    image_encoder: str = 'resnetv1-18',
-    feature_encoder_dims: Optional[Tuple[int]] = (64, 64),
-    fused_feature_encoder_dims: Optional[Tuple[int]] = (64, 64),
-) -> nn.Module:
-    obs_encoder_defs = {}
-    for key in input_keys:
-        if 'image' in key:
-            encoder = encoders[image_encoder]()
-            obs_encoder_defs[key] = PreprocessEncoder(encoder=encoder, normalize=True, resize=True, resize_shape=(224, 224))
-        else:
-            obs_encoder_defs[key] = MLP(hidden_dims=feature_encoder_dims[:-1], output_dim=feature_encoder_dims[-1])
-    
-    # fused network for parameter sharing
-    if fused_feature_encoder_dims is not None:
-        fused_net_def = nn.Sequential([MLP(hidden_dims=fused_feature_encoder_dims[:-1], output_dim=fused_feature_encoder_dims[-1])])
-    else:
-        fused_net_def = None
-
-    obs_encoder_def = WithMappedEncoders(
-        encoders=obs_encoder_defs, 
-        network=fused_net_def,
-        concatenate_keys=input_keys
-    )
-    return obs_encoder_def
-
-
-def create_simple_diffusion_learner(
-        seed: int,
-        shape_meta: Dict[str, Any],
-        output_key: str,
-        encoder_def: WithMappedEncoders = None,
-        config: Dict[str, Any] = get_default_config(),
-        load_pretrained_weights: bool = False,
-        **kwargs):
-    """
-    Creates a SimpleDiffusionAgent instance that uses a diffusion-based UNet model.
-    Follows a structure reminiscent of create_bc_learner, but replaces the policy with UNet.
-    """
-    if config is None:
-        scheduler_kwargs = DEFAULT_SCHEDULER_CONFIG
-        optim_kwargs = DEFAULT_OPTIM_CONFIG
-        net_kwargs = DEFAULT_UNET_CONFIG
-    else:
-        scheduler_kwargs = config.scheduler_kwargs
-        optim_kwargs = config.optim_kwargs
-        net_kwargs = config.net_kwargs
-
-    print('Extra kwargs:', kwargs)
-    rng = jax.random.PRNGKey(seed)
-
-    assert isinstance(encoder_def, WithMappedEncoders), "encoder_def must be a LowDimEncoder instance"
-    # set up scheduler from diffusers
-    if scheduler_kwargs is None:
-        scheduler_kwargs = {}
-    scheduler = FlaxDDIMScheduler(**scheduler_kwargs)
-
-    # Build the UNet or encoder+UNet
-    unet_def = DiffusionUNet(**net_kwargs)
-    if encoder_def is not None:
-        model_def = WithEncoder(encoder=encoder_def, network=unet_def)
-    else:
-        model_def = unet_def
-
-    # Init the model
-    bsz = shape_meta["batch_size"]
-    input_shapes = shape_meta["input_shapes"]
-    output_shape = shape_meta["output_shape"][output_key]
-
-    # Create zero tensors for inputs
-    batch_obs = {key: jnp.zeros(shape) for key, shape in input_shapes.items()}
-    batch_obs[output_key] = jnp.zeros(output_shape)
-
-    if hasattr(encoder_def, "concatenate_keys"):
-        encoder_keys = encoder_def.concatenate_keys
-    else:
-        encoder_keys = list(set(input_shapes.keys()) - {output_key})
-
-    params_dict = model_def.init(
-        rng, batch_obs,
-        x=batch_obs[output_key],
-        timesteps=jax.random.randint(
-            rng, (bsz,), 0, scheduler_kwargs["num_train_timesteps"]), 
-    )
-    print("successfully initialized model")
-    tx = optax.adam(**optim_kwargs)
-    
-    model = TrainState.create(
-        model_def, 
-        params=params_dict['params'],
-        tx=tx
-    )
-
-    if load_pretrained_weights:
-        load_pretrained_params(
-            params_dict['params'],
-            params_dict['extra_variables'],
-            model.params,
-            model.extra_variables,
-            prefix_key=f'encoder/encoders/{encoder_def.name}'
-    )
-
-    return SimpleDiffusionAgent(
-        rng,
-        model=model,
-        scheduler=scheduler,
-        scheduler_params=frozen_dict.freeze(scheduler_kwargs),
-        num_inference_steps=config.num_inference_steps,
-        num_obs_steps=config.num_obs_steps,
-        num_action_steps=config.num_action_steps,
-        horizon=config.horizon,
-        num_train_timesteps=scheduler_kwargs["num_train_timesteps"],
-        shape_meta=shape_meta,
-        output_key=output_key
-    )
-
-
-def create_ric_guidance_schedule(
-        initial_value: float,
-        final_value: float = None,
-        num_steps: int = None
-    ) -> Schedule:
-
-    if final_value is None:
-        return optax.constant_schedule(initial_value)
-    if num_steps is None:
-        num_steps = 100
-
-    return optax.linear_schedule(initial_value, final_value, num_steps)
+        # Update action queue in eval state
+        start, end = self.num_obs_steps - 1, self.num_obs_steps - 1 + self.num_action_steps
+        self = self.update_eval_state(actions=sample.transpose(1, 0, 2)[start:end])
+        action = self.eval_state.action_queue.popleft()
+        return action
 
 
 class RICDiffusionAgent(SimpleDiffusionAgent):
@@ -679,6 +616,129 @@ class RICDiffusionAgent(SimpleDiffusionAgent):
         return sample
 
 
+def create_input_encoder(
+    input_keys: Tuple[str, ...],
+    image_encoder: str = 'resnetv1-18',
+    feature_encoder_dims: Optional[Tuple[int]] = (64, 64),
+    fused_feature_encoder_dims: Optional[Tuple[int]] = (64, 64),
+) -> nn.Module:
+    obs_encoder_defs = {}
+    for key in input_keys:
+        if 'image' in key:
+            encoder = encoders[image_encoder]()
+            obs_encoder_defs[key] = PreprocessEncoder(encoder=encoder, normalize=True, resize=True, resize_shape=(224, 224))
+        else:
+            obs_encoder_defs[key] = MLP(hidden_dims=feature_encoder_dims[:-1], output_dim=feature_encoder_dims[-1])
+    
+    # fused network for parameter sharing
+    if fused_feature_encoder_dims is not None:
+        fused_net_def = nn.Sequential([MLP(hidden_dims=fused_feature_encoder_dims[:-1], output_dim=fused_feature_encoder_dims[-1])])
+    else:
+        fused_net_def = None
+
+    obs_encoder_def = WithMappedEncoders(
+        encoders=obs_encoder_defs, 
+        network=fused_net_def,
+        concatenate_keys=input_keys
+    )
+    return obs_encoder_def
+
+
+def create_simple_diffusion_learner(
+        seed: int,
+        shape_meta: Dict[str, Any],
+        output_key: str,
+        encoder_def: WithMappedEncoders = None,
+        config: Dict[str, Any] = get_default_config(),
+        load_pretrained_weights: bool = False,
+        **kwargs):
+    """
+    Creates a SimpleDiffusionAgent instance that uses a diffusion-based UNet model.
+    Follows a structure reminiscent of create_bc_learner, but replaces the policy with UNet.
+    """
+    if config is None:
+        scheduler_kwargs = DEFAULT_SCHEDULER_CONFIG
+        optim_kwargs = DEFAULT_OPTIM_CONFIG
+        net_kwargs = DEFAULT_UNET_CONFIG
+    else:
+        scheduler_kwargs = config.scheduler_kwargs
+        optim_kwargs = config.optim_kwargs
+        net_kwargs = config.net_kwargs
+
+    print('Extra kwargs:', kwargs)
+    rng = jax.random.PRNGKey(seed)
+
+    assert isinstance(encoder_def, WithMappedEncoders), "encoder_def must be a LowDimEncoder instance"
+    # set up scheduler from diffusers
+    if scheduler_kwargs is None:
+        scheduler_kwargs = {}
+
+    # Build the UNet or encoder+UNet
+    unet_def = DiffusionUNet(**net_kwargs)
+    if encoder_def is not None:
+        model_def = WithEncoder(encoder=encoder_def, network=unet_def)
+    else:
+        model_def = unet_def
+
+    # Init the model
+    bsz = shape_meta["batch_size"]
+    input_shapes = shape_meta["input_shapes"]
+    output_shape = shape_meta["output_shape"][output_key]
+
+    # Create zero tensors for inputs
+    batch_obs = {key: jnp.zeros(shape) for key, shape in input_shapes.items()}
+    batch_obs[output_key] = jnp.zeros(output_shape)
+
+    params_dict = model_def.init(
+        rng, batch_obs,
+        x=batch_obs[output_key],
+        timesteps=jax.random.randint(
+            rng, (bsz,), 0, scheduler_kwargs["num_train_timesteps"]), 
+    )
+    print("successfully initialized model")
+    tx = optax.adam(**optim_kwargs)
+    
+    model = TrainState.create(
+        model_def, 
+        params=params_dict['params'],
+        tx=tx
+    )
+
+    if load_pretrained_weights:
+        load_pretrained_params(
+            params_dict['params'],
+            params_dict['extra_variables'],
+            model.params,
+            model.extra_variables,
+            prefix_key=f'encoder/encoders/{encoder_def.name}'
+    )
+
+    return SimpleDiffusionAgent(
+        rng,
+        model=model,
+        shape_meta=shape_meta,
+        scheduler_params=frozen_dict.freeze(scheduler_kwargs),
+        num_obs_steps=config.num_obs_steps,
+        num_action_steps=config.num_action_steps,
+        horizon=config.horizon,
+        # output_key=output_key,
+    )
+
+
+def create_ric_guidance_schedule(
+        initial_value: float,
+        final_value: float = None,
+        num_steps: int = None
+    ) -> Schedule:
+
+    if final_value is None:
+        return optax.constant_schedule(initial_value)
+    if num_steps is None:
+        num_steps = 100
+
+    return optax.linear_schedule(initial_value, final_value, num_steps)
+
+
 def create_iql_learner(checkpoint_path, shape_meta, seed, max_steps, **kwargs):
     import os
     import sys
@@ -749,7 +809,6 @@ def create_ric_diffusion_learner(
             tx=world_model_tx
         )
 
-    scheduler = FlaxDDIMScheduler(**scheduler_kwargs)
     model_def = DiffusionUNet(**net_kwargs)
     if encoder_def is not None:
         model_def = WithEncoder(encoder=encoder_def, network=model_def)
@@ -775,8 +834,6 @@ def create_ric_diffusion_learner(
     # Combine into guided agent
     return RICDiffusionAgent(
         model=model,
-        scheduler=scheduler,
-        scheduler_params=frozen_dict.freeze(scheduler_kwargs),
         world_model=world_model,
         guidance_scale=guidance_scale
     )
