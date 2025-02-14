@@ -49,7 +49,7 @@ flags.DEFINE_integer('log_interval', 10, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 10000, 'Eval interval.')
 flags.DEFINE_integer('save_interval', 25000, 'Save interval.')
 flags.DEFINE_integer('batch_size', 128, 'Mini batch size.')
-flags.DEFINE_integer('max_steps', int(31250), 'Number of training steps.')
+flags.DEFINE_integer('max_steps', int(32500), 'Number of training steps.')
 flags.DEFINE_integer('num_workers', 16, 'Number of workers for dataloader.')
 flags.DEFINE_integer('num_devices', 4, 'Number of devices to use.')
 flags.DEFINE_string('config_overrides', None, 
@@ -231,9 +231,11 @@ def main(_):
     output_shape = tuple(sample_batch[output_key].shape)
     # Apply multi-device sharding if needed
     if FLAGS.num_devices > 1:
-        mesh = MeshShardingHelper([FLAGS.num_devices], ['fsdp'])
+        mesh = MeshShardingHelper([FLAGS.num_devices], ["data"])
 
-        update_fn = functools.partial(mesh.sjit, static_argnums=(2,))(update_fn)
+        update_fn = functools.partial(mesh.sjit, static_argnums=(2,), 
+                                      in_shardings=[FSDPShardingRule(), None]
+                                      )(update_fn)
         sample_actions = mesh.sjit(functools.partial(sample_actions, output_shape=output_shape))
 
     policy_fn = lambda x: np.array(sample_actions(x))  # noqa: E731
@@ -251,7 +253,7 @@ def main(_):
         target = batch[output_key]
         agent, metrics = update_fn(batch, target, output_shape)
 
-        if i % FLAGS.eval_interval == 0:
+        if i % FLAGS.eval_interval == 0 or i == 1:
             eval_info = evaluate(policy_fn, env, num_episodes=FLAGS.eval_episodes)
             eval_metrics = {f'evaluation/{k}': v for k, v in eval_info.items()}
             wandb.log(eval_metrics, step=i)

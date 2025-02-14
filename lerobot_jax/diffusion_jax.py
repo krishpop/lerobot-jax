@@ -357,12 +357,8 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
     num_action_steps: int = 8
     horizon: int = 16
     shape_meta: FrozenDict = None
-    # output_key: str = None
     num_inference_steps: int = 100
     eval_state: Optional[AgentEvalState] = None
-
-    # observation_queue: deque = deque(maxlen=num_obs_steps)
-    # action_queue: deque = deque(maxlen=num_action_steps)
 
     def add_noise(
             self,
@@ -422,7 +418,7 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
                 params=params
             )
 
-            l2_loss = jnp.mean((pred - target)**2)
+            l2_loss = jnp.mean((noise - pred)**2)
             return l2_loss, {'diffusion_loss': l2_loss}
 
         new_model, info = self.model.apply_loss_fn(loss_fn=loss_fn, has_aux=True)
