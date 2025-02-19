@@ -62,5 +62,5 @@ def compute_normalization_stats(dataset, keys, n_devices, cache_filepath="normal
 
     if cache_filepath is not None:
         np.save(cache_filepath, stats)
-    return global_count, global_total, global_min, global_max, global_total_sq
+    return stats
     

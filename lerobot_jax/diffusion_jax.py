@@ -406,8 +406,8 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
         # scheduler_state = scheduler.create_state()
 
         def loss_fn(params):
-            noise = jax.random.normal(rng, output_shape)
-            timesteps = jax.random.randint(rng, (output_shape[0],), 0, 100)
+            noise = jax.random.normal(rng, self.shape_meta["output_shape"]["action"])
+            timesteps = jax.random.randint(rng, (self.shape_meta["batch_size"],), 0, 100)
             noisy_actions = self.add_noise(target, noise, timesteps)
             # noisy_actions = agent.add_noise(scheduler, scheduler_state, target, noise, timesteps)
             pred = self.model(

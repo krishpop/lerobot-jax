@@ -101,12 +101,13 @@ def load_dataset_and_env(dataset_name, config, return_config=False):
         env = make_env(cfg)
         dataset = make_dataset(cfg, split="train")
         print(f"Loaded dataset of length {len(dataset)} on CPU")
-    elif dataset_name == 'd3il-stacking':
+    elif dataset_name == 'd3il-stacking': 
+        policy_name = f"{algo}_d3il_stacking_state" if algo == "diffusion" else "tdmpc2_d3il_stacking"
         base_overrides = [
             "env=d3il_stacking_state", 
             "+env.use_wrapper=True",
             "device=cpu", 
-            f"policy={algo}_d3il_stacking_state"
+            f"policy={policy_name}"
         ]
         cfg = init_hydra_config(
             f"{LEROBOT_ROOT}/configs/default.yaml",
@@ -166,8 +167,10 @@ def main(_):
     cache_filepath = f"{FLAGS.dataset}_normalization_stats.npy"
     hf_dataset = dataset.hf_dataset.with_format("jax")
     filter_keys = list(cfg.policy.input_shapes.keys()) + list(cfg.policy.output_shapes.keys())
+    if FLAGS.algo == 'tdmpc2':
+        filter_keys = filter_keys + ['next.reward']
     hf_dataset = hf_dataset.select_columns(filter_keys)
-    normalization_stats = compute_normalization_stats(hf_dataset, filter_keys, FLAGS.num_devices, cache_filepath)
+    normalization_stats = compute_normalization_stats(hf_dataset, filter_keys, FLAGS.num_devices, cache_filepath).item()
     normalization_modes = {k: cfg.policy.input_normalization_modes[k] for k in cfg.policy.input_shapes.keys()}
     normalization_modes.update({k: cfg.policy.output_normalization_modes[k] for k in cfg.policy.output_shapes.keys()})
 
@@ -197,25 +200,26 @@ def main(_):
     assert len(output_shapes) == 1, "Only one output shape is supported"
     output_key = list(output_shapes.keys())[0]
     rng = jax.random.PRNGKey(FLAGS.seed)
-    if FLAGS.algo == 'tdmpc2':
-        from lerobot_jax.tdmpc2_jax import update_fn, sample_actions
-        # Update config with shapes from environment
-        config.update({
-            'input_shapes': input_shapes,
-            'output_shapes': output_shapes,
-            'action_dim': env.action_space.shape[0],
-            'obs': 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
-        })
-        agent = create_tdmpc2_learner(config, rng, dataset)
-
-    elif FLAGS.algo == 'diffusion':
-        encoder_def = create_input_encoder(input_keys)
-        shape_meta = {
+    shape_meta = {
             "batch_size": FLAGS.batch_size,
             "input_shapes": {k: sample_batch[k].shape for k in input_keys},
             "output_shape": {output_key: sample_batch[output_key].shape}
-        }
-        shape_meta = frozen_dict.freeze(shape_meta)
+    }
+    shape_meta = frozen_dict.freeze(shape_meta)
+
+    if FLAGS.algo == 'tdmpc2':
+        # Update config with shapes from environment
+        cfg = TDMPC2Config(**config)
+        cfg.action_dim = env.action_space.shape[0]
+        cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
+        cfg.input_shapes = input_shapes
+        cfg.output_shapes = output_shapes
+        agent = create_tdmpc2_learner(cfg, rng, normalization_stats, normalization_modes, shape_meta)
+        update_fn = agent.update
+        sample_actions = agent.sample_actions
+
+    elif FLAGS.algo == 'diffusion':
+        encoder_def = create_input_encoder(input_keys) 
         agent = create_simple_diffusion_learner(
             seed=FLAGS.seed,
             shape_meta=shape_meta,
@@ -233,10 +237,10 @@ def main(_):
     if FLAGS.num_devices > 1:
         mesh = MeshShardingHelper([FLAGS.num_devices], ["data"])
 
-        update_fn = functools.partial(mesh.sjit, static_argnums=(2,), 
+        update_fn = functools.partial(mesh.sjit, 
                                       in_shardings=[FSDPShardingRule(), None]
                                       )(update_fn)
-        sample_actions = mesh.sjit(functools.partial(sample_actions, output_shape=output_shape))
+        sample_actions = mesh.sjit(sample_actions)
 
     policy_fn = lambda x: np.array(sample_actions(x))  # noqa: E731
     # Training loop
@@ -251,7 +255,7 @@ def main(_):
 
         # Update step
         target = batch[output_key]
-        agent, metrics = update_fn(batch, target, output_shape)
+        agent, metrics = update_fn(batch, target)
 
         if i % FLAGS.eval_interval == 0 or i == 1:
             eval_info = evaluate(policy_fn, env, num_episodes=FLAGS.eval_episodes)

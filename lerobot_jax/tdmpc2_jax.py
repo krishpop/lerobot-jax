@@ -16,14 +16,15 @@ import tqdm
 import wandb
 from absl import app, flags
 from flax import struct
+from flax.core import frozen_dict, FrozenDict
 from flax.training import checkpoints
 from jaxrl_m.common import TrainState, target_update
 from jaxrl_m.evaluation import evaluate
 from jaxrl_m.networks import ensemblize
 from jaxrl_m.typing import *
 from jaxrl_m.vision.preprocess import PreprocessEncoder
-from jaxrl_m.vision.tdmpc2_simple_conv import TDMPC2SimpleConv
 from jaxrl_m.wandb import default_wandb_config, get_flag_dict, setup_wandb
+from lerobot_jax.model_utils import TDMPC2SimpleConv, WithMappedEncoders
 from ml_collections import ConfigDict, config_flags
 
 from .model_utils import MLP
@@ -81,10 +82,6 @@ class TDMPC2Config:
     action_dims: Tuple[int, ...] = ()  # Action dimensions for each task
     n_action_steps: int = 5
     n_action_repeats: int = 1
-    # Normalization configuration
-    normalization_stats: Dict[str, Dict[str, jnp.ndarray]] = None
-    normalization_modes: Dict[str, str] = None
-
 
 
 # ----------------------------------------------------------------------------------------
@@ -93,36 +90,95 @@ class TDMPC2Config:
 class WorldModel(nn.Module):
     """
     JAX version of TDMPC2's world model with task embedding support.
+	TD-MPC2 implicit world model architecture.
+	Can be used for both single-task and multi-task experiments.
     """
     cfg: TDMPC2Config
 
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, cond: Batch, task: Optional[Union[int, jnp.ndarray]] = None):  # noqa: F405
-        # Add task embedding if multitask
+    def setup(self):
+        # Create task embedding and action masks if using multitask.
         if self.cfg.multitask:
             self.task_emb = nn.Embed(
                 num_embeddings=len(self.cfg.tasks),
                 features=self.cfg.task_dim,
-                embedding_init=nn.initializers.uniform(scale=1.0)
+                embedding_init=nn.initializers.uniform(scale=1.0),
             )
-            # Create action masks buffer - in JAX we'll pass this as needed
             if self.cfg.action_mask:
-                self._action_masks = jnp.zeros((len(self.cfg.tasks), self.cfg.action_dim))
+                masks = jnp.zeros((len(self.cfg.tasks), self.cfg.action_dim))
                 for i in range(len(self.cfg.tasks)):
-                    self._action_masks = self._action_masks.at[i, :self.cfg.action_dims[i]].set(1.0)
+                    masks = masks.at[i, :self.cfg.action_dims[i]].set(1.0)
+                self._action_masks = masks
             else:
                 self._action_masks = None
 
-        # Rest of the setup remains same
+        # Set up the encoder based on observation type.
         if self.cfg.obs == "rgb":
-            encoder_def = TDMPC2SimpleConv(num_channels=self.cfg.num_channels, apply_shift_aug=True)
-            self.encoder = PreprocessEncoder(encoder_def, normalize=True, resize=True, resize_shape=(224, 224))
+            encoder_def = TDMPC2SimpleConv(
+                num_channels=self.cfg.num_channels, apply_shift_aug=True
+            )
+            img_encoder = PreprocessEncoder(
+                encoder_def, normalize=True, resize=True, resize_shape=(224, 224)
+            )
+        # Check if inputs are provided as a dict with multiple keys.
+        if (
+            isinstance(self.cfg.input_shapes, dict)
+            and len(self.cfg.input_shapes) > 1
+        ):
+            encoder_defs = {}
+            for key in self.cfg.input_shapes:
+                # Use a simple MLP for state inputs.
+                if key.endswith("state"):
+                    encoder_defs[key] = MLP((128, 128), self.cfg.latent_dim)
+                else:
+                    encoder_defs[key] = img_encoder
+            self.encoder = WithMappedEncoders(encoders=encoder_defs, network=None, concatenate_keys=list(self.cfg.input_shapes.keys()))
         else:
-            self.encoder = MLP((128, 128), self.cfg.latent_dim)
+            if self.cfg.obs == "rgb":
+                self.encoder = img_encoder
+            else:
+                self.encoder = MLP((128, 128), self.cfg.latent_dim)
+
+        # Instantiate the rest of the submodules.
         self.dynamics = MLP((128, 128, self.cfg.latent_dim))
-        self.reward = MLP((128, 128, 5))  # 5 categories for discrete reward
-        self.Q_list = ensemblize(MLP, self.cfg.num_q, (128, 128, 5))
+        self.reward = MLP((128, 128, 5))  # 5 categories for discrete reward.
+        self.Q_list = ensemblize(MLP, self.cfg.num_q)(hidden_dims=(128, 128, 5))
         self.pi_base = MLP((128, 128, 2 * self.cfg.action_dim))
+
+    def __call__(
+        self, batch_obs: Data, task: Optional[Union[int, jnp.ndarray]] = None,
+    ):
+        """
+        Forward pass.
+
+        Args:
+            x: observations or a dict of observations.
+            task: Task ID or array of task IDs (optional).
+
+        Returns:
+            next_z: Next latent state predicted by the dynamics network.
+        """
+
+        x = {k: batch_obs[k][:, :-1] for k in self.cfg.input_shapes if k.startswith('observation')}
+        a = batch_obs["action"]
+
+        # Apply task conditioning if using multitask.
+        if self.cfg.multitask and task is not None:
+            # The get_task_embedding method (unchanged) combines x with an
+            # embedded task representation.
+            x = self.get_task_embedding(x, task)
+
+        # Encode the input.
+        z = self.encoder(x)
+        if a is not None:
+            z = jnp.concatenate([z, a], axis=-1)
+
+        # Compute the next latent state.
+        next_z = self.dynamics(z)
+        qs = self.Qs(z, a)
+
+        rewards = self.reward(jnp.concatenate([next_z, a], axis=-1))
+
+        return next_z, qs
 
     def get_task_embedding(self, x: jnp.ndarray, task: Union[int, jnp.ndarray]) -> jnp.ndarray:
         """
@@ -215,10 +271,7 @@ class WorldModel(nn.Module):
             z = self.get_task_embedding(z, task)
             
         q_input = jnp.concatenate([z, action], axis=-1)
-        all_qs = []
-        for q_model in self.Q_list:
-            q_cat = q_model(q_input)
-            all_qs.append(q_cat)
+        all_qs = self.Q_list(q_input)
         return jnp.stack(all_qs, axis=0)  # shape [num_q, batch, 5]
 
 
@@ -273,8 +326,10 @@ class AgentEvalState:
 # ----------------------------------------------------------------------------------------
 class TDMPC2Agent(flax.struct.PyTreeNode):
     rng: jax.random.PRNGKey
-    model: WorldModel
+    model: TrainState
     cfg: TDMPC2Config
+    normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]] = None
+    normalization_modes: FrozenDict[str, str] = None
     eval_state: Optional[AgentEvalState] = None
     _use_image: bool = False
     _use_env_state: bool = False
@@ -487,7 +542,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         return self.model_def.apply(self._state.params, z, action, method=WorldModel.next)
 
     def reward_fn(self, z: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-        return self.model_def.apply(self._state.params, z, action, method=WorldModel.reward_fn)
+        return self.model_def.apply(self._state.params, z, action, method=WorldModel.reward)
 
     def pi(self, z: jnp.ndarray, rng: jax.random.PRNGKey, eval_mode: bool = False):
         return self.model_def.apply(self._state.params, z, rng, eval_mode, method=WorldModel.pi)
@@ -569,7 +624,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         action, _info = self.pi(z, rng, eval_mode)
         return action[0]
 
-    def update(agent, batch: Batch) -> InfoDict:  # noqa: F405
+    def update(agent, batch: Batch, target: jnp.ndarray=None) -> InfoDict:  # noqa: F405
         """
         A complete TDMPC2-style update, incorporating logic similar to tdmpc2.py.
         It includes:
@@ -583,7 +638,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         Args:
             agent: An agent object with model, Qs, policy, etc.
             batch: A dictionary of JAX arrays including:
-                'observations', 'actions', 'rewards', 'next_observations', (optionally) 'task'.
+                'observations', 'actions', 'rewards', (optionally) 'task'.
 
         Returns:
             info: An InfoDict of training metrics.
@@ -592,10 +647,11 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         # ----------------------------------------------------
         # 1) Parse the batch. If tasks are included, extract them.
         # ----------------------------------------------------
-        obs = batch['observations']
-        next_obs = batch['next_observations']
-        actions = batch['actions']
-        rewards = batch['rewards']
+        obs = {k: batch[k][:, :-1] for k in agent.cfg.input_shapes if k.startswith('observation')}
+        next_obs = {k: batch[k][:, 1:] 
+                    for k in agent.cfg.input_shapes if k.startswith('observation')}
+        actions = batch['action']
+        rewards = batch['next.reward']
 
         task = batch.get('task', None)  # optional
 
@@ -655,11 +711,6 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
               - Q-value loss from a TD perspective.
               - Policy update.
             """
-            # Encode initial
-            z0 = agent.model.encode(obs[0], task)
-            # Also encode next obs for future steps
-            z_next_obs = agent.model.encode(next_obs, task)
-
             # Step-by-step consistency
             consistency_loss = 0.0
             # If we have horizon steps in obs, each dimension should be [T, B, D]
@@ -673,9 +724,10 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             reward_loss = 0.0
 
             # For each step t in [0..T-1], do a forward rollout
+            zt_next = None
             for t in range(T - 1):
                 # Current z 
-                zt = agent.model.encode(obs[t], task)
+                zt = agent.model.encode(obs[t], task) if zt_next is None else zt_next
                 # Next z from model
                 zt_next_pred = agent.model.next(zt, actions[t], task=task)
                 # Next z from data
@@ -685,7 +737,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
 
                 # Reward prediction
                 reward_pred_logits = agent.model.reward(zt, actions[t], task=task)  # shape [B, 5]
-                true_rew = jax.nn.one_hot(rewards[t].astype(jnp.int32), reward_pred_logits.shape[-1])
+                true_rew = jax.nn.one_hot(rewards[:,t].astype(jnp.int32), reward_pred_logits.shape[-1])
                 rew_loss = cross_entropy_loss(reward_pred_logits, true_rew)
                 reward_loss += rew_loss
 
@@ -695,7 +747,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
 
                 # Next z for TD 
                 # We'll do a 1-step TD target
-                td_val = td_target(zt_next, rewards[t])
+                td_val = td_target(zt_next, rewards[:,t])
                 td_targets_all.append(td_val)
 
             # Average consistency and reward loss
@@ -758,7 +810,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             loss_val, info_dict = rollout_loss(params)
             return loss_val, info_dict
 
-        loss_val_and_info, grads = jax.value_and_grad(loss_and_grad_wrapper, has_aux=True)(agent.model.Qs.params)
+        loss_val_and_info, grads = jax.value_and_grad(loss_and_grad_wrapper, has_aux=True)(agent.model.params["Q_list"])
         loss_val, info_dict = loss_val_and_info
 
         # Update critic parameters
@@ -783,164 +835,48 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         )
         return updated_agent, info
 
-    def update_step(
-        self,
-        obs_batch: jnp.ndarray,
-        action_batch: jnp.ndarray,
-        reward_batch: jnp.ndarray,
-        next_obs_batch: jnp.ndarray,
-        rng: jax.random.PRNGKey,
-    ) -> Tuple[Any, Dict[str, float]]:  # noqa: F405
-        """
-        Single update step, reminiscent of cql.py style.
-        """
 
-        def loss_fn(params):
-            # Encode
-            z0 = self.model_def.apply(params, obs_batch, method=WorldModel.encode)
-            zn = self.model_def.apply(params, next_obs_batch, method=WorldModel.encode)
-
-            # Next latent from predicted dynamics
-            # We'll do a simple consistent rollout for 1-step
-            # t=0
-            z0_next = self.model_def.apply(params, z0, action_batch, method=WorldModel.next)
-
-            # Consistency loss
-            consistency_loss = jnp.mean((z0_next - zn) ** 2)
-
-            # Reward
-            reward_pred = self.model_def.apply(params, z0, action_batch, method=WorldModel.reward_fn)
-            # cross-entropy with the real reward, or MSE if you have continuous
-            # but TDMPC2 uses discrete representation
-            # For demonstration, assume reward_batch is an integer from 0..4
-            # Create a one-hot
-            n_categories = reward_pred.shape[-1]
-            reward_one_hot = jax.nn.one_hot(reward_batch.astype(jnp.int32), n_categories)
-            reward_loss = cross_entropy_loss(reward_pred, reward_one_hot)
-
-            # Q update
-            # We do a 1-step TD update for demonstration
-            # Q(s,a) ~ reward + discount * min Q(s', pi(s'))
-            # We only handle discrete Q here for demonstration
-            discount = self.cfg.discount_max
-            next_action, _ = self.model_def.apply(params, zn, rng, False, method=WorldModel.pi)
-            # next_action is shape [batch, action_dim]
-            # Q(s', a') -> output shape [num_q, batch, 5]
-            # We'll treat the Q as discrete distribution
-            q_next_logits = self.model_def.apply(params, zn, next_action, method=WorldModel.Qs)
-            # average across Q's
-            q_next_logits_mean = jnp.mean(q_next_logits, axis=0)
-            # next_value = two_hot_inv(q_next_logits_mean).squeeze(-1)
-            next_value = two_hot_inv(q_next_logits_mean).squeeze(-1)
-
-            target_value = two_hot_inv(reward_pred).squeeze(-1) + discount * next_value
-            # Q(s,a) ...
-            q_current_logits = self.model_def.apply(params, z0, action_batch, method=WorldModel.Qs)
-            # We'll do cross-entropy minimization w.r.t. target in discrete bins
-            # For demonstration, let's approximate the target as one-hot
-            # in five discrete categories. This is a big simplification.
-            # We'll clamp it to [-2,2], find nearest category
-            target_clamped = jnp.clip(target_value, -2.0, 2.0)
-            # Map float to discrete index in [-2, -1, 0,1,2].
-            cats = jnp.array([-2.0, -1.0, 0.0, 1.0, 2.0])
-            def find_cat_idx(val):
-                diff = jnp.abs(cats - val)
-                return jnp.argmin(diff)
-            cat_indices = jax.vmap(find_cat_idx)(target_clamped)
-            target_onehot = jax.nn.one_hot(cat_indices, 5)
-            # Q loss
-            # sum over Q's
-            q_loss = 0.0
-            for i in range(self.cfg.num_q):
-                q_logit = q_current_logits[i]  # shape [batch, 5]
-                q_loss += cross_entropy_loss(q_logit, target_onehot)
-            q_loss = q_loss / float(self.cfg.num_q)
-
-            total_loss = (
-                self.cfg.consistency_coef * consistency_loss
-                + self.cfg.reward_coef * reward_loss
-                + self.cfg.value_coef * q_loss
-            )
-
-            return total_loss, {
-                "consistency_loss": consistency_loss,
-                "reward_loss": reward_loss,
-                "q_loss": q_loss,
-            }
-
-        grads_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss_val, aux_vals), grads = grads_fn(self.critic.params)
-        new_critic = self.critic.apply_gradients(grads=grads)
-        # Soft-update using common.target_update
-        new_target_critic = target_update(new_critic, self.target_critic, tau=0.005)
-
-        metrics = {
-            "loss": float(loss_val),
-            "consistency_loss": float(aux_vals["consistency_loss"]),
-            "reward_loss": float(aux_vals["reward_loss"]),
-            "q_loss": float(aux_vals["q_loss"]),
-        }
-        return new_state, metrics
-
-    def train_step(
-        self,
-        obs_batch: jnp.ndarray,
-        action_batch: jnp.ndarray,
-        reward_batch: jnp.ndarray,
-        next_obs_batch: jnp.ndarray,
-        rng: jax.random.PRNGKey,
-    ) -> Dict[str, float]:
-        """
-        Top-level API for a single train step. JIT compile or call repeatedly in an outer loop.
-        """
-        new_state, metrics = self.update_step(
-            obs_batch, action_batch, reward_batch, next_obs_batch, rng
-        )
-        self._state = new_state
-        return metrics
+def create_q_ensemble(rng, cfg, example_q_input):
+    """
+    Build an ensemble of Q networks externally.
     
-
-def update_fn(agent, batch, **kwargs):
-    # Convert batch to expected format
-    obs = {k: batch[k][:, 0] for k in input_shapes}
-    next_obs = {k.replace('observation', 'next.observation'): batch[k][:, 1] 
-                for k in input_shapes if k.startswith('observation')}
-    actions = batch['action']
-    rewards = batch['next.reward']
+    Args:
+        rng: JAX PRNGKey.
+        cfg: A config object containing at least cfg.num_q and cfg.critic_lr.
+        example_q_input: An example input (e.g. concatenated [z, a]) used for parameter initialization.
     
-    # Update step
-    new_agent, info = agent.update(
-        obs=obs,
-        next_obs=next_obs,
-        actions=actions,
-        rewards=rewards,
-        rng=agent.rng
-    )
-    return new_agent, info
-
-
-def sample_actions(obs_dict, rng):
-    """Policy function for evaluation with TDMPC2."""
-    # Reset queues if needed (at episode start)
-    if agent.eval_state is None or len(agent.eval_state.action_queue) == 0:
-        agent = agent.init_eval_state()
-    
-    # Select action using the agent's select_action method
-    action = agent.sample_actions(obs_dict)
-    return action
+    Returns:
+        A TrainState containing the Q ensemble.
+    """
+    # Define the ensemble using ensemblize along with any additional settings.
+    q_def = ensemblize(MLP, cfg.num_q, out_axes=0)
+    # Instantiate the ensemble by passing the hidden dims.
+    q_net = q_def(hidden_dims=(128, 128, 5))
+    return q_net
 
 
 def create_tdmpc2_learner(
-    config: ConfigDict,
+    config: TDMPC2Config,
     rng: jax.random.PRNGKey,
     normalization_stats: Dict = None,
+    normalization_modes: Dict = None,
+    shape_meta: Dict = None,
     **kwargs
 ) -> TDMPC2Agent:
     """Create a TDMPC2 agent with proper initialization."""
     
+    normalization_stats = frozen_dict.freeze(normalization_stats)
+    normalization_modes = frozen_dict.freeze(normalization_modes)
+    input_shapes = shape_meta["input_shapes"]
+
+    # Create zero tensors for inputs
+    batch_obs = {key: jnp.zeros(shape) for key, shape in input_shapes.items()}
+    batch_obs.update({k: jnp.zeros(shape_meta["output_shape"][k]) for k in shape_meta["output_shape"]})
+
     # Initialize model
+    # critic_def = create_q_ensemble(rng, config, batch_obs)
     model_def = WorldModel(config)
-    params = model_def.init(rng, jnp.zeros((1, 100)))['params']
+    params = model_def.init(rng, batch_obs)['params']
     model = TrainState.create(model_def, params, tx=optax.adam(learning_rate=config.lr))
 
     # Determine observation types
@@ -952,11 +888,6 @@ def create_tdmpc2_learner(
         assert len(image_keys) == 1, "Expected exactly one image observation key"
         input_image_key = image_keys[0]
 
-    # Setup normalization if dataset is provided
-    if normalization_stats is not None:
-        # Update config with normalization info
-        config.normalization_stats = normalization_stats
-
     # Create agent
     agent = TDMPC2Agent(
         rng=rng,
@@ -965,6 +896,8 @@ def create_tdmpc2_learner(
         _use_image=use_image,
         _use_env_state=use_env_state,
         input_image_key=input_image_key,
+        normalization_stats=normalization_stats,
+        normalization_modes=normalization_modes,
     )
     
     # Initialize queues
