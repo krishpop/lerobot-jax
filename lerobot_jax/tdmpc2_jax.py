@@ -42,14 +42,14 @@ class TDMPC2Config:
     # Training
     lr: float = 3e-4
     enc_lr_scale: float = 1.0
-    max_std: float = 0.5
-    min_std: float = 0.01
-    horizon: int = 5
+    max_std: float = 2.0
+    min_std: float = 0.05
+    horizon: int = 3
     num_samples: int = 64
     num_elites: int = 6
     iterations: int = 10
     num_pi_trajs: int = 4
-    temperature: float = 2.0
+    temperature: float = 0.5
     grad_clip_norm: float = 100.0
     batch_size: int = 256
     discount_min: float = 0.99
@@ -72,7 +72,7 @@ class TDMPC2Config:
     episode_length: int = 200
     episode_lengths: Tuple[int, ...] = ()
     # Temperature for Gumbel-Softmax sampling, etc.
-    rho: float = 0.95
+    rho: float = 0.5
     # For large action dims
     action_mask: bool = False
     # Multitask specific
@@ -131,7 +131,11 @@ class WorldModel(nn.Module):
                     encoder_defs[key] = MLP((128, 128), self.cfg.latent_dim)
                 else:
                     encoder_defs[key] = img_encoder
-            self.encoder = WithMappedEncoders(encoders=encoder_defs, network=None, concatenate_keys=list(self.cfg.input_shapes.keys()))
+            self.encoder = WithMappedEncoders(
+                encoders=encoder_defs,
+                network=nn.Sequential([nn.Dense(self.cfg.latent_dim), nn.relu]),
+                concatenate_keys=list(self.cfg.input_shapes.keys()),
+            )
         else:
             if self.cfg.obs == "rgb":
                 self.encoder = img_encoder
@@ -139,10 +143,10 @@ class WorldModel(nn.Module):
                 self.encoder = MLP((128, 128), self.cfg.latent_dim)
 
         # Instantiate the rest of the submodules.
-        self.dynamics = MLP((128, 128, self.cfg.latent_dim))
-        self.reward = MLP((128, 128, 5))  # 5 categories for discrete reward.
-        self.Q_list = ensemblize(MLP, self.cfg.num_q)(hidden_dims=(128, 128, 5))
-        self.pi_base = MLP((128, 128, 2 * self.cfg.action_dim))
+        self.dynamics = MLP((128, 128), self.cfg.latent_dim)
+        self.reward = MLP((128, 128), 5)  # 5 categories for discrete reward.
+        self.Q_list = ensemblize(MLP, self.cfg.num_q)(hidden_dims=(128, 128), output_dim=5)
+        self.pi_base = MLP((128, 128), 2 * self.cfg.action_dim)
 
     def __call__(
         self, batch_obs: Data, task: Optional[Union[int, jnp.ndarray]] = None,
@@ -168,15 +172,16 @@ class WorldModel(nn.Module):
             x = self.get_task_embedding(x, task)
 
         # Encode the input.
-        z = self.encoder(x)
+        z_enc = self.encoder(x)
         if a is not None:
-            z = jnp.concatenate([z, a], axis=-1)
+            z = jnp.concatenate([z_enc, a], axis=-1)
 
         # Compute the next latent state.
         next_z = self.dynamics(z)
-        qs = self.Qs(z, a)
+        qs = self.Qs(z_enc, a)
 
         rewards = self.reward(jnp.concatenate([next_z, a], axis=-1))
+        actions = self.pi(next_z, jax.random.PRNGKey(0))
 
         return next_z, qs
 
@@ -245,7 +250,7 @@ class WorldModel(nn.Module):
         # Get mean and log_std
         base_out = self.pi_base(z)
         mean, log_std = jnp.split(base_out, 2, axis=-1)
-        log_std = jnp.clip(log_std, -5.0, 1.0)
+        log_std = jnp.clip(log_std, -10.0, 2.0)
 
         if eval_mode:
             action = mean
@@ -274,6 +279,8 @@ class WorldModel(nn.Module):
         all_qs = self.Q_list(q_input)
         return jnp.stack(all_qs, axis=0)  # shape [num_q, batch, 5]
 
+    def reward_fn(self, z: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+        return self.reward(jnp.concatenate([z, action], axis=-1))
 
 
 # ----------------------------------------------------------------------------------------
@@ -536,22 +543,22 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         return agent.eval_state.action_queue.popleft()
 
     def encode(self, obs: jnp.ndarray) -> jnp.ndarray:
-        return self.model_def.apply(self._state.params, obs, method=WorldModel.encode)
+        return self.model(obs, method=WorldModel.encode)
 
     def next(self, z: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-        return self.model_def.apply(self._state.params, z, action, method=WorldModel.next)
+        return self.model(jnp.concatenate([z, action], axis=-1), method=WorldModel.next)
 
     def reward_fn(self, z: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-        return self.model_def.apply(self._state.params, z, action, method=WorldModel.reward)
+        return self.model.reward_fn(z, action)
 
     def pi(self, z: jnp.ndarray, rng: jax.random.PRNGKey, eval_mode: bool = False):
-        return self.model_def.apply(self._state.params, z, rng, eval_mode, method=WorldModel.pi)
+        return self.model(z, rng, eval_mode, method=WorldModel.pi)
 
     def Qs(self, z: jnp.ndarray, action: jnp.ndarray):
         """
         Return shape [num_q, batch, 5].
         """
-        return self.model_def.apply(self._state.params, z, action, method=WorldModel.Qs)
+        return self.model(jnp.concatenate([z, action], axis=-1), method=WorldModel.Qs)
 
     def plan(self, obs: jnp.ndarray, rng: jax.random.PRNGKey, eval_mode: bool = False):
         """
@@ -715,7 +722,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             consistency_loss = 0.0
             # If we have horizon steps in obs, each dimension should be [T, B, D]
             # We'll do a single-step or multi-step approach based on shapes.
-            T = obs.shape[0]
+            T = rewards.shape[1]
 
             # Collect partial TD targets
             td_targets_all = []
@@ -727,22 +734,22 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             zt_next = None
             for t in range(T - 1):
                 # Current z 
-                zt = agent.model.encode(obs[t], task) if zt_next is None else zt_next
+                zt = agent.model.encode({k: obs[k][:, t] for k in agent.cfg.input_shapes if k.startswith('observation')}, task) if zt_next is None else zt_next
                 # Next z from model
-                zt_next_pred = agent.model.next(zt, actions[t], task=task)
+                zt_next_pred = agent.model.next(zt, actions[:, t], task=task)
                 # Next z from data
-                zt_next = agent.model.encode(next_obs[t], task=task)
+                zt_next = agent.model.encode({k: next_obs[k][:, t] for k in agent.cfg.input_shapes if k.startswith('observation')}, task=task)
                 # Consistency
                 consistency_loss += jnp.mean((zt_next_pred - zt_next) ** 2)
 
                 # Reward prediction
-                reward_pred_logits = agent.model.reward(zt, actions[t], task=task)  # shape [B, 5]
+                reward_pred_logits = agent.reward_fn(zt, actions[:, t])  # shape [B, 5]
                 true_rew = jax.nn.one_hot(rewards[:,t].astype(jnp.int32), reward_pred_logits.shape[-1])
                 rew_loss = cross_entropy_loss(reward_pred_logits, true_rew)
                 reward_loss += rew_loss
 
                 # Q distribution for Q(s,a)
-                qs_logits = agent.model.Qs(zt, actions[t], task=task)  # shape [num_q, B, 5]
+                qs_logits = agent.model.Qs(zt, actions[:, t], task=task)  # shape [num_q, B, 5]
                 q_logits_all.append(qs_logits)
 
                 # Next z for TD 
@@ -803,18 +810,11 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             }
             return total_loss_with_pi, losses_dict
 
-        # ----------------------------------------------------
-        # 4) Use JAX grad to compute and apply updates to agent's parameters.
-        # ----------------------------------------------------
-        def loss_and_grad_wrapper(params):
-            loss_val, info_dict = rollout_loss(params)
-            return loss_val, info_dict
-
-        loss_val_and_info, grads = jax.value_and_grad(loss_and_grad_wrapper, has_aux=True)(agent.model.params["Q_list"])
-        loss_val, info_dict = loss_val_and_info
+        new_model, info_dict = agent.model.apply_loss_fn(loss_fn=rollout_loss, has_aux=True)
+        loss_val = info_dict.pop('loss_val', None)
 
         # Update critic parameters
-        new_critic = agent.critic.apply_gradients(grads=grads)
+        new_model = new_model.apply_gradients(grads=grads)
 
         # Soft update target critic
         new_target_critic = agent.soft_update(agent.target_critic, new_critic, agent.config['tau'])
@@ -830,8 +830,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         # Return updated agent and the info
         updated_agent = agent.replace(
             rng=rng_updated,
-            critic=new_critic,
-            target_critic=new_target_critic
+            model=new_model,
         )
         return updated_agent, info
 

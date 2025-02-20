@@ -210,7 +210,7 @@ def main(_):
     if FLAGS.algo == 'tdmpc2':
         # Update config with shapes from environment
         cfg = TDMPC2Config(**config)
-        cfg.action_dim = env.action_space.shape[0]
+        cfg.action_dim = env.action_space.shape[-1]
         cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
         cfg.input_shapes = input_shapes
         cfg.output_shapes = output_shapes
