@@ -23,6 +23,7 @@ import wandb
 import torch
 from lerobot_jax.diffusion_jax import (
     create_simple_diffusion_learner, 
+    create_ric_diffusion_learner,
     get_default_config, 
     create_input_encoder
 )
@@ -92,6 +93,8 @@ def load_dataset_and_env(dataset_name, config, return_config=False):
             "env=d3il_stacking", 
             "+env.use_wrapper=True",
             "device=cpu", 
+            f"eval.batch_size={min(50, FLAGS.eval_episodes)}",
+            f"eval.n_episodes={FLAGS.eval_episodes}",
             f"policy={algo}_d3il_stacking"
         ]
         cfg = init_hydra_config(
@@ -107,6 +110,8 @@ def load_dataset_and_env(dataset_name, config, return_config=False):
             "env=d3il_stacking_state", 
             "+env.use_wrapper=True",
             "device=cpu", 
+            f"eval.batch_size={min(50, FLAGS.eval_episodes)}",
+            f"eval.n_episodes={FLAGS.eval_episodes}",
             f"policy={policy_name}"
         ]
         cfg = init_hydra_config(
@@ -215,7 +220,7 @@ def main(_):
         cfg.input_shapes = input_shapes
         cfg.output_shapes = output_shapes
         agent = create_tdmpc2_learner(cfg, rng, normalization_stats, normalization_modes, shape_meta)
-        update_fn = agent.update
+        update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
 
     elif FLAGS.algo == 'diffusion':
@@ -227,19 +232,27 @@ def main(_):
             encoder_def=encoder_def,
             config=config
         )
-        update_fn = agent.update
+        update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
+        sample_actions = agent.sample_actions
+    elif FLAGS.algo == 'ric':
+        encoder_def = create_input_encoder(input_keys) 
+        agent = create_ric_diffusion_learner(
+            seed=FLAGS.seed,
+            shape_meta=shape_meta,
+            output_key=output_key,
+            encoder_def=encoder_def,
+            config=config
+        )
+        update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
     else:
         raise ValueError(f"Unsupported algorithm: {FLAGS.algo}")
 
-    output_shape = tuple(sample_batch[output_key].shape)
     # Apply multi-device sharding if needed
     if FLAGS.num_devices > 1:
-        mesh = MeshShardingHelper([FLAGS.num_devices], ["data"])
+        mesh = MeshShardingHelper([FLAGS.num_devices], ["fsdp"])
 
-        update_fn = functools.partial(mesh.sjit, 
-                                      in_shardings=[FSDPShardingRule(), None]
-                                      )(update_fn)
+        update_fn = functools.partial(mesh.sjit, in_shardings=[FSDPShardingRule(fsdp_axis_name="fsdp")])(update_fn)
         sample_actions = mesh.sjit(sample_actions)
 
     policy_fn = lambda x: np.array(sample_actions(x))  # noqa: E731
@@ -254,8 +267,7 @@ def main(_):
             batch = get_batch(train_iter)
 
         # Update step
-        target = batch[output_key]
-        agent, metrics = update_fn(batch, target)
+        agent, metrics = update_fn(batch)
 
         if i % FLAGS.eval_interval == 0 or i == 1:
             eval_info = evaluate(policy_fn, env, num_episodes=FLAGS.eval_episodes)

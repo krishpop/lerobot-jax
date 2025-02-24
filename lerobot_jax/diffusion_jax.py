@@ -400,16 +400,16 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
             )
         )
 
-    def update(self, batch: Batch, target: Data, output_shape: Tuple[int, ...]):
+    def update(self, batch: Batch, pmap_axis: Optional[str] = None):
         """A single gradient update step."""
         rng = jax.random.PRNGKey(self.model.step)
+        actions = batch["action"]
         # scheduler_state = scheduler.create_state()
 
         def loss_fn(params):
             noise = jax.random.normal(rng, self.shape_meta["output_shape"]["action"])
             timesteps = jax.random.randint(rng, (self.shape_meta["batch_size"],), 0, 100)
-            noisy_actions = self.add_noise(target, noise, timesteps)
-            # noisy_actions = agent.add_noise(scheduler, scheduler_state, target, noise, timesteps)
+            noisy_actions = self.add_noise(actions, noise, timesteps)
             pred = self.model(
                 batch,
                 x=noisy_actions,
@@ -421,7 +421,7 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
             l2_loss = jnp.mean((noise - pred)**2)
             return l2_loss, {'diffusion_loss': l2_loss}
 
-        new_model, info = self.model.apply_loss_fn(loss_fn=loss_fn, has_aux=True)
+        new_model, info = self.model.apply_loss_fn(loss_fn=loss_fn, has_aux=True, pmap_axis=pmap_axis)
         return self.replace(model=new_model), info
 
     def update_eval_state(
@@ -745,14 +745,14 @@ def create_iql_learner(checkpoint_path, shape_meta, seed, max_steps, **kwargs):
     from train_offline import load_checkpoint as load_iql_checkpoint # type: ignore
     empty_obs = np.zeros(shape_meta["observation_shape"])[np.newaxis]
     empty_action = np.zeros(shape_meta["action_shape"])[np.newaxis]
-    agent = Learner(seed,
+    iql_learner = Learner(seed,
                     empty_obs,
                     empty_action,
                     max_steps=max_steps,
                     **kwargs)
 
-    load_iql_checkpoint(agent, checkpoint_path)
-    return agent
+    load_iql_checkpoint(iql_learner, checkpoint_path)
+    return iql_learner
 
 
 def create_ric_diffusion_learner(
