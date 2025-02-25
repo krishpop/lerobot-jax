@@ -1,33 +1,31 @@
-from .model_utils import MLP, WithEncoder, WithMappedEncoders
-from .tdmpc2_jax import TDMPC2Config, two_hot_inv, WorldModel 
-
-import jax
-import einops
 import functools
-import jax.numpy as jnp
-import numpy as np
-import jax.lax as lax
+from collections import deque
+
+import einops
 import flax
 import flax.linen as nn
-from flax import struct
-from flax.core import frozen_dict, FrozenDict
+import jax
+import jax.lax as lax
+import jax.numpy as jnp
+import ml_collections
+import numpy as np
 import optax
-
-from jaxrl_m.typing import *
+from diffusers import FlaxDDIMScheduler
+from diffusers.schedulers.scheduling_ddim_flax import DDIMSchedulerState
+from flax import struct
+from flax.core import FrozenDict, frozen_dict
 from jaxrl_m.common import TrainState
+from jaxrl_m.dataset import Dataset
+from jaxrl_m.evaluation import supply_rng
+from jaxrl_m.typing import *
 from jaxrl_m.vision import encoders
 from jaxrl_m.vision.data_augmentations import random_crop
 from jaxrl_m.vision.preprocess import PreprocessEncoder
-from jaxrl_m.dataset import Dataset
-from jaxrl_m.evaluation import supply_rng
 from jaxrl_m.vision.pretrained_utils import load_pretrained_params
-import ml_collections
-from collections import deque
-
-from diffusers import FlaxDDIMScheduler
-from diffusers.schedulers.scheduling_ddim_flax import DDIMSchedulerState
 from optax.schedules import Schedule
 
+from lerobot_jax.agents.tdmpc2_jax import TDMPC2Config, WorldModel, two_hot_inv
+from lerobot_jax.utils.model_utils import MLP, WithEncoder, WithMappedEncoders
 
 DEFAULT_HF_UNET_CONFIG = {
     # Size of the action sequence (horizon length)
@@ -741,8 +739,8 @@ def create_iql_learner(checkpoint_path, shape_meta, seed, max_steps, **kwargs):
 
     sys.path.append(os.path.expanduser("~/implicit_q_learning"))
 
-    from learner import Learner # type: ignore
-    from train_offline import load_checkpoint as load_iql_checkpoint # type: ignore
+    from learner import Learner  # type: ignore
+    from train_offline import load_checkpoint as load_iql_checkpoint  # type: ignore
     empty_obs = np.zeros(shape_meta["observation_shape"])[np.newaxis]
     empty_action = np.zeros(shape_meta["action_shape"])[np.newaxis]
     iql_learner = Learner(seed,

@@ -3,6 +3,7 @@ import os
 import numpy as np
 import jax.numpy as jnp
 import lerobot
+from flax.core import FrozenDict
 from functools import partial
 from jax import lax, pmap
 from typing import Dict
@@ -100,9 +101,10 @@ def normalize_transform(batch: jnp.ndarray,
     else:
         raise ValueError(f"Unsupported normalization mode: {mode}")
 
+@partial(jax.jit, static_argnames=("normalization_stats", "normalization_modes"))
 def normalize_inputs(batch: Dict[str, jnp.ndarray],
-                     normalization_stats: Dict[str, Dict[str, jnp.ndarray]],
-                     normalization_modes: Dict[str, str]) -> Dict[str, jnp.ndarray]:
+                     normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]],
+                     normalization_modes: FrozenDict[str, str]) -> Dict[str, jnp.ndarray]:
     """
     Normalize a dictionary of inputs using the provided normalization statistics and modes.
 

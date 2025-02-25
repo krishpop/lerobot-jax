@@ -17,19 +17,24 @@ import tqdm
 import wandb
 from absl import app, flags
 from flax import struct
-from flax.core import frozen_dict, FrozenDict
+from flax.core import FrozenDict, frozen_dict
 from flax.training import checkpoints
 from jaxrl_m.common import target_update
 from jaxrl_m.evaluation import evaluate
-from jaxrl_m.networks import ensemblize, Critic
+from jaxrl_m.networks import Critic, ensemblize
 from jaxrl_m.typing import *
 from jaxrl_m.vision.preprocess import PreprocessEncoder
 from jaxrl_m.wandb import default_wandb_config, get_flag_dict, setup_wandb
-from lerobot_jax.model_utils import TrainState, TDMPC2SimpleConv, WithMappedEncoders
 from ml_collections import ConfigDict, config_flags
 
-from lerobot_jax.norm_utils import normalize_inputs, unnormalize_outputs
-from .model_utils import MLP, SimNorm
+from lerobot_jax.utils.model_utils import (
+    MLP,
+    SimNorm,
+    TDMPC2SimpleConv,
+    TrainState,
+    WithMappedEncoders,
+)
+from lerobot_jax.utils.norm_utils import normalize_inputs, unnormalize_outputs
 
 # -------------
 # Config class

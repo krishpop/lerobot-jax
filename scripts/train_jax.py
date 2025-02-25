@@ -27,14 +27,14 @@ from omegaconf import OmegaConf
 from scalax.sharding import FSDPShardingRule, MeshShardingHelper, PartitionSpec
 from torch.utils.data import DataLoader
 
-from lerobot_jax.diffusion_jax import (
+from lerobot_jax.agents.diffusion_jax import (
     create_input_encoder,
     create_ric_diffusion_learner,
     create_simple_diffusion_learner,
     get_default_config,
 )
-from lerobot_jax.tdmpc2_jax import TDMPC2Agent, TDMPC2Config, create_tdmpc2_learner
-from lerobot_jax.utils import LEROBOT_ROOT, compute_normalization_stats
+from lerobot_jax.agents.tdmpc2_jax import TDMPC2Agent, TDMPC2Config, create_tdmpc2_learner
+from lerobot_jax.utils.norm_utils import LEROBOT_ROOT, compute_normalization_stats
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('algo', 'diffusion', 'Algorithm to use: tdmpc2 or diffusion.')
@@ -211,7 +211,7 @@ def main(_):
     if FLAGS.algo == 'tdmpc2':
         # Update config with shapes from environment
         cfg = TDMPC2Config(**config)
-        with jdc.copy_and_mutate(cfg) as cfg:
+        with jdc.copy_and_mutate(cfg, validate=False) as cfg:
             cfg.action_dim = env.action_space.shape[-1]
             cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
             cfg.input_shapes = input_shapes
@@ -254,7 +254,7 @@ def main(_):
 
     else:
         update_fn = jax.jit(update_fn)
-        sample_actions = jax.jit(sample_actions)
+        # sample_actions = jax.jit(sample_actions)
 
     policy_fn = lambda x: np.array(sample_actions(x))  # noqa: E731
     # Training loop
