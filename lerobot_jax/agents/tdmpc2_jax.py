@@ -9,6 +9,7 @@ import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import jax_dataclasses as jdc
 import numpy as np
 import omegaconf
 import optax
@@ -27,6 +28,7 @@ from jaxrl_m.wandb import default_wandb_config, get_flag_dict, setup_wandb
 from lerobot_jax.model_utils import TrainState, TDMPC2SimpleConv, WithMappedEncoders
 from ml_collections import ConfigDict, config_flags
 
+from lerobot_jax.norm_utils import normalize_inputs, unnormalize_outputs
 from .model_utils import MLP, SimNorm
 
 # -------------
@@ -34,7 +36,7 @@ from .model_utils import MLP, SimNorm
 # -------------
 
 
-@dataclass
+@jdc.pytree_dataclass
 class TDMPC2Config:
     """
     Configuration for TDMPC2. Adjust or extend as necessary.
@@ -63,15 +65,15 @@ class TDMPC2Config:
     mlp_dim: int = 128
     num_channels: int = 32
     input_shapes: Dict[str, str] = None
+    image_keys: Tuple[str, ...] = ()
     output_shapes: Dict[str, str] = None
     dropout: float = 0.0  # 0.01
     simnorm_dim: int = 8
-    obs: str = "state"  # Observation type (state or rgb)
+    # obs: str = "state"  # Observation type (state or rgb)
     # Loss coefficients
     consistency_coef: float = 20.0
     reward_coef: float = 0.1
     value_coef: float = 0.1
-    critic_loss_fn: str = "td-error"
     # actor
     log_std_min: float = -10
     log_std_max: float = 2
@@ -142,7 +144,7 @@ class WorldModel(nn.Module):
                 self._action_masks = None
 
         # Set up the encoder based on observation type.
-        if self.cfg.obs == "rgb":
+        if len(self.cfg.image_keys) > 0:
             encoder_def = TDMPC2SimpleConv(
                 num_channels=self.cfg.num_channels,
                 apply_shift_aug=True,
@@ -171,7 +173,7 @@ class WorldModel(nn.Module):
                 concatenate_keys=list(self.cfg.input_shapes.keys()),
             )
         else:
-            if self.cfg.obs == "rgb":
+            if len(self.cfg.image_keys) > 0:
                 self.encoder = img_encoder
             else:
                 self.encoder = MLP((128, 128), output_dim=self.cfg.latent_dim)
@@ -263,15 +265,11 @@ class WorldModel(nn.Module):
 
         return jnp.concatenate([x, emb], axis=-1)
 
-    def encode(
-        self, obs: jnp.ndarray, task: Optional[Union[int, jnp.ndarray]] = None
-    ) -> jnp.ndarray:
+    def encode(self, obs: jnp.ndarray, task: Optional[Union[int, jnp.ndarray]] = None) -> jnp.ndarray:
         """
         Encode observations with optional task embedding.
         """
         if self.cfg.multitask and task is not None:
-            if isinstance(obs, dict):
-                obs = obs[self.cfg.obs]
             obs = self.get_task_embedding(obs, task)
 
         return self.encoder(obs)
@@ -593,76 +591,6 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
                 "Unsupported return_type. Expected 'min', 'avg', or 'all'."
             )
 
-    def normalize_inputs(self, batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
-        """
-        Normalize inputs based on dataset statistics.
-
-        Args:
-            batch: Dictionary of input arrays to normalize.
-
-        Returns:
-            Normalized batch dictionary.
-        """
-        batch = dict(batch)  # Shallow copy to avoid mutating input
-
-        # Normalize each key based on its mode
-        for key in batch:
-            if key not in self.cfg.normalization_stats:
-                continue
-
-            stats = self.cfg.normalization_stats[key]
-            mode = self.cfg.normalization_modes[key]
-
-            if mode == "mean_std":
-                mean = stats["mean"]
-                std = stats["std"]
-                batch[key] = (batch[key] - mean) / (std + 1e-8)
-            elif mode == "min_max":
-                min_val = stats["min"]
-                max_val = stats["max"]
-                # First normalize to [0,1]
-                batch[key] = (batch[key] - min_val) / (max_val - min_val + 1e-8)
-                # Then to [-1, 1]
-                batch[key] = batch[key] * 2.0 - 1.0
-
-        return batch
-
-    def unnormalize_outputs(
-        self, batch: Dict[str, jnp.ndarray]
-    ) -> Dict[str, jnp.ndarray]:
-        """
-        Unnormalize outputs back to original scale.
-
-        Args:
-            batch: Dictionary of output arrays to unnormalize.
-
-        Returns:
-            Unnormalized batch dictionary.
-        """
-        batch = dict(batch)  # Shallow copy to avoid mutating input
-
-        # Unnormalize each key based on its mode
-        for key in batch:
-            if key not in self.cfg.normalization_stats:
-                continue
-
-            stats = self.cfg.normalization_stats[key]
-            mode = self.cfg.normalization_modes[key]
-
-            if mode == "mean_std":
-                mean = stats["mean"]
-                std = stats["std"]
-                batch[key] = batch[key] * std + mean
-            elif mode == "min_max":
-                min_val = stats["min"]
-                max_val = stats["max"]
-                # First from [-1, 1] to [0, 1]
-                batch[key] = (batch[key] + 1.0) / 2.0
-                # Then to original range
-                batch[key] = batch[key] * (max_val - min_val) + min_val
-
-        return batch
-
     def populate_queues(
         self, queues: Dict[str, collections.deque], batch: Dict[str, jnp.ndarray]
     ) -> Dict[str, collections.deque]:
@@ -673,7 +601,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
                 new_queues[key].append(batch[key])
         return new_queues
 
-    @partial(jax.jit, static_argnums=(0,))
+    # @partial(jax.jit, static_argnums=(0,))
     def sample_actions(
         agent, observations: Dict[str, jnp.ndarray], *, seed: PRNGKey = None
     ) -> jnp.ndarray:
@@ -688,7 +616,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed) if seed is not None else agent.model.key
 
         # Normalize inputs
-        batch = agent.normalize_inputs(observations)
+        batch = normalize_inputs(observations, agent.normalization_stats, agent.normalization_modes)
         if agent._use_image:
             batch = dict(batch)  # shallow copy
             batch["observation.image"] = batch[agent.input_image_key]
@@ -732,7 +660,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             actions = jnp.clip(actions, -1.0, 1.0)
 
             # Unnormalize actions
-            actions = agent.unnormalize_outputs({"action": actions})["action"]
+            actions = unnormalize_outputs({"action": actions}, agent.normalization_stats, agent.normalization_modes)["action"]
 
             # Handle action repeats
             if agent.cfg.n_action_repeats > 1:
@@ -746,7 +674,8 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
                     agent.eval_state.action_queue.append(act)
 
         # Return next action from queue
-        return agent.eval_state.action_queue.popleft()
+        action = agent.eval_state.action_queue.popleft()
+        return action
 
     def encode(self, obs: jnp.ndarray) -> jnp.ndarray:
         return self.model.encode(obs)
@@ -954,37 +883,6 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         #    We do "unroll" each step: z_{t+1} = model.next(z_t, action_t).
         # ----------------------------------------------------
 
-        def experimental_critic_loss_fn(
-            q_logits_all, td_targets_all, horizon_factor, num_q
-        ):
-            """
-            Compute the critic loss using JAX-compatible vectorized operations.
-            """
-            cat_vals = jnp.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=jnp.float32)
-
-            # Clamp target values
-            td_clamped = jnp.clip(td_targets_all, -2.0, 2.0)
-
-            # Find nearest index (vectorized)
-            target_idx = jax.vmap(lambda val: jnp.argmin(jnp.abs(cat_vals - val)))(
-                td_clamped
-            )
-
-            # Compute target distribution (vectorized one-hot encoding)
-            target_dist = jax.nn.one_hot(target_idx, num_classes=5)
-
-            # Compute loss for all Q networks (batch vmap over `num_q`)
-            def per_q_loss(q_logits, target_dist):
-                return jnp.mean(jax.vmap(soft_ce)(q_logits, target_dist))
-
-            # Vectorize over the ensemble dimension `num_q`
-            q_loss_sum = jnp.mean(
-                jax.vmap(per_q_loss, in_axes=(0, None))(q_logits_all, target_dist)
-            )
-
-            # Normalize by horizon factor
-            return q_loss_sum / horizon_factor
-
         zt_buffer = []
 
         def td_error_loss(qs, td_targets, horizon_factor):
@@ -1138,13 +1036,31 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             return total_loss_with_pi.mean(), losses_dict
 
         # Update world model, policy, and critic parameters
+        print("about to update model")
         new_model, info_dict = agent.model.apply_loss_fn(
             loss_fn=update_model, has_aux=True, pmap_axis=pmap_axis
         )
+        print("about to update critic")
         new_critic, critic_info = agent.critic.apply_loss_fn(
             loss_fn=update_critic, has_aux=True, pmap_axis=pmap_axis
         )
-        info_dict.update(critic_info)
+        print("info_dict keys", info_dict.keys())
+        print("critic_info keys", critic_info.keys())
+        info = {}
+        for k in info_dict.keys():
+            if isinstance(info_dict[k], jnp.ndarray):
+                if info_dict[k].size == 1:
+                    info[k] = info_dict[k]
+                else:
+                    info[k] = info_dict[k].mean(axis=0)
+            else:
+                info[k] = info_dict[k]
+        for k in critic_info.keys():
+            if isinstance(critic_info[k], jnp.ndarray):
+                if critic_info[k].size == 1:
+                    info[k] = critic_info[k]
+                else:
+                    info[k] = critic_info[k].mean(axis=0)
 
         # Soft update target critic
         new_target_critic = target_update(
@@ -1154,9 +1070,6 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         # Update agent's rng so it changes after each update.
         rng_updated = jax.random.split(agent.rng, 2)[0]
 
-        # Prepare final info dict with numeric indicators
-        info = info_dict
-
         # Return updated agent and the info
         updated_agent = agent.replace(
             rng=rng_updated,
@@ -1164,6 +1077,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             critic=new_critic,
             target_critic=new_target_critic,
         )
+        print("updated agent")
         return updated_agent, info
 
 
@@ -1194,7 +1108,7 @@ def create_tdmpc2_learner(
 ) -> TDMPC2Agent:
     """Create a TDMPC2 agent with proper initialization."""
 
-    jax.tree_util.register_dataclass(TDMPC2Config)
+    # jax.tree_util.register_dataclass(TDMPC2Config)
     normalization_stats = frozen_dict.freeze(normalization_stats)
     normalization_modes = frozen_dict.freeze(normalization_modes)
     input_shapes = shape_meta["input_shapes"]

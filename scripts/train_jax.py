@@ -1,44 +1,40 @@
+import functools
 import os
 import pickle
-from absl import app, flags
-from ml_collections import config_flags
+from dataclasses import asdict
+
 import jax
 import jax.numpy as jnp
+import jax_dataclasses as jdc
 import numpy as np
+import torch
 import tqdm
-from torch.utils.data import DataLoader
-from jax.tree_util import tree_map
+import wandb
+from absl import app, flags
+from diffusers import FlaxDDIMScheduler
 from flax.core import frozen_dict
-from jaxrl_m.wandb import setup_wandb, default_wandb_config, get_flag_dict
+from flax.training import checkpoints
+from jax.tree_util import tree_map
 from jaxrl_m.evaluation import evaluate
 from jaxrl_m.typing import *
-from lerobot.common.datasets.utils import cycle
+from jaxrl_m.wandb import default_wandb_config, get_flag_dict, setup_wandb
 from lerobot.common.datasets.factory import make_dataset
+from lerobot.common.datasets.utils import cycle
 from lerobot.common.envs.factory import make_env
 from lerobot.common.utils.utils import init_hydra_config
+from ml_collections import ConfigDict, config_flags
 from omegaconf import OmegaConf
+from scalax.sharding import FSDPShardingRule, MeshShardingHelper, PartitionSpec
+from torch.utils.data import DataLoader
 
-import functools
-import wandb
-import torch
 from lerobot_jax.diffusion_jax import (
-    create_simple_diffusion_learner, 
+    create_input_encoder,
     create_ric_diffusion_learner,
-    get_default_config, 
-    create_input_encoder
+    create_simple_diffusion_learner,
+    get_default_config,
 )
-from lerobot_jax.tdmpc2_jax import (
-    create_tdmpc2_learner,
-    TDMPC2Agent, 
-    TDMPC2Config
-)
-from lerobot_jax.utils import compute_normalization_stats, LEROBOT_ROOT
-from flax.training import checkpoints
-from scalax.sharding import MeshShardingHelper, PartitionSpec, FSDPShardingRule
-from ml_collections import ConfigDict
-from dataclasses import asdict
-from diffusers import FlaxDDIMScheduler
-
+from lerobot_jax.tdmpc2_jax import TDMPC2Agent, TDMPC2Config, create_tdmpc2_learner
+from lerobot_jax.utils import LEROBOT_ROOT, compute_normalization_stats
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('algo', 'diffusion', 'Algorithm to use: tdmpc2 or diffusion.')
@@ -215,10 +211,11 @@ def main(_):
     if FLAGS.algo == 'tdmpc2':
         # Update config with shapes from environment
         cfg = TDMPC2Config(**config)
-        cfg.action_dim = env.action_space.shape[-1]
-        cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
-        cfg.input_shapes = input_shapes
-        cfg.output_shapes = output_shapes
+        with jdc.copy_and_mutate(cfg) as cfg:
+            cfg.action_dim = env.action_space.shape[-1]
+            cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
+            cfg.input_shapes = input_shapes
+            cfg.output_shapes = output_shapes
         agent = create_tdmpc2_learner(cfg, rng, normalization_stats, normalization_modes, shape_meta)
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
@@ -255,6 +252,10 @@ def main(_):
         update_fn = functools.partial(mesh.sjit, in_shardings=[FSDPShardingRule(fsdp_axis_name="fsdp")])(update_fn)
         sample_actions = mesh.sjit(sample_actions)
 
+    else:
+        update_fn = jax.jit(update_fn)
+        sample_actions = jax.jit(sample_actions)
+
     policy_fn = lambda x: np.array(sample_actions(x))  # noqa: E731
     # Training loop
     for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
@@ -267,6 +268,7 @@ def main(_):
             batch = get_batch(train_iter)
 
         # Update step
+        breakpoint()
         agent, metrics = update_fn(batch)
 
         if i % FLAGS.eval_interval == 0 or i == 1:
