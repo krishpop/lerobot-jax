@@ -7,7 +7,7 @@ from flax.core import FrozenDict
 from functools import partial
 from jax import lax, pmap
 from typing import Dict
-
+import jax_dataclasses as jdc
 
 LEROBOT_ROOT = lerobot.__path__[0]
 
@@ -58,11 +58,11 @@ def compute_normalization_stats(dataset, keys, n_devices, cache_filepath="normal
         data_sharded = shard_data(data, n_devices)
         global_count, global_total, global_min, global_max, global_total_sq = compute_global_stats(data_sharded)
         stats[key] = {
-            'global_count': global_count,
-            'global_total': global_total,
-            'global_min': global_min,
-            'global_max': global_max,
-            'global_total_sq': global_total_sq
+            'count': np.array(global_count.mean(axis=0)),
+            'total': np.array(global_total.mean(axis=0)),
+            'min': np.array(global_min.mean(axis=0)),
+            'max': np.array(global_max.mean(axis=0)),
+            'total_sq': np.array(global_total_sq.mean(axis=0))
         }
 
     if cache_filepath is not None:
@@ -70,7 +70,6 @@ def compute_normalization_stats(dataset, keys, n_devices, cache_filepath="normal
     return stats
 
 
-@partial(jax.jit, static_argnames=("mode",))
 def normalize_transform(batch: jnp.ndarray,
                         stats: Dict[str, jnp.ndarray],
                         mode: str,
@@ -101,10 +100,9 @@ def normalize_transform(batch: jnp.ndarray,
     else:
         raise ValueError(f"Unsupported normalization mode: {mode}")
 
-@partial(jax.jit, static_argnames=("normalization_stats", "normalization_modes"))
 def normalize_inputs(batch: Dict[str, jnp.ndarray],
-                     normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]],
-                     normalization_modes: FrozenDict[str, str]) -> Dict[str, jnp.ndarray]:
+                     normalization_stats: Dict[str, Dict[str, jnp.ndarray]],
+                     normalization_modes: Dict[str, str]) -> Dict[str, jnp.ndarray]:
     """
     Normalize a dictionary of inputs using the provided normalization statistics and modes.
 
@@ -124,6 +122,7 @@ def normalize_inputs(batch: Dict[str, jnp.ndarray],
         mode = normalization_modes[key]
         new_batch[key] = normalize_transform(value, stats, mode)
     return new_batch
+
 
 def unnormalize_outputs(batch: Dict[str, jnp.ndarray],
                         normalization_stats: Dict[str, Dict[str, jnp.ndarray]],

@@ -174,6 +174,8 @@ def main(_):
     normalization_stats = compute_normalization_stats(hf_dataset, filter_keys, FLAGS.num_devices, cache_filepath).item()
     normalization_modes = {k: cfg.policy.input_normalization_modes[k] for k in cfg.policy.input_shapes.keys()}
     normalization_modes.update({k: cfg.policy.output_normalization_modes[k] for k in cfg.policy.output_shapes.keys()})
+    normalization_modes = frozen_dict.freeze(normalization_modes)
+    normalization_stats = frozen_dict.freeze(normalization_stats)
 
     input_shapes = OmegaConf.to_container(cfg.policy.input_shapes, resolve=True)
     output_shapes = OmegaConf.to_container(cfg.policy.output_shapes, resolve=True)
@@ -213,10 +215,12 @@ def main(_):
         cfg = TDMPC2Config(**config)
         with jdc.copy_and_mutate(cfg, validate=False) as cfg:
             cfg.action_dim = env.action_space.shape[-1]
-            cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
+            cfg.image_keys = tuple(list(filter(lambda x: x.startswith('observation.image'), input_shapes.keys())))
             cfg.input_shapes = input_shapes
             cfg.output_shapes = output_shapes
-        agent = create_tdmpc2_learner(cfg, rng, normalization_stats, normalization_modes, shape_meta)
+            cfg.normalization_stats = normalization_stats
+            cfg.normalization_modes = normalization_modes
+        agent = create_tdmpc2_learner(cfg, rng, shape_meta)
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
 
@@ -230,7 +234,7 @@ def main(_):
             config=config
         )
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
-        sample_actions = agent.sample_actions
+        sample_actions = lambda x: agent.sample_actions(x, output_shape=output_shapes[output_key])  # noqa: E731
     elif FLAGS.algo == 'ric':
         encoder_def = create_input_encoder(input_keys) 
         agent = create_ric_diffusion_learner(
@@ -250,7 +254,7 @@ def main(_):
         mesh = MeshShardingHelper([FLAGS.num_devices], ["fsdp"])
 
         update_fn = functools.partial(mesh.sjit, in_shardings=[FSDPShardingRule(fsdp_axis_name="fsdp")])(update_fn)
-        sample_actions = mesh.sjit(sample_actions)
+        # sample_actions = functools.partial(mesh.sjit, in_shardings=[FSDPShardingRule(fsdp_axis_name="fsdp")])(sample_actions)
 
     else:
         update_fn = jax.jit(update_fn)
@@ -268,7 +272,6 @@ def main(_):
             batch = get_batch(train_iter)
 
         # Update step
-        breakpoint()
         agent, metrics = update_fn(batch)
 
         if i % FLAGS.eval_interval == 0 or i == 1:
