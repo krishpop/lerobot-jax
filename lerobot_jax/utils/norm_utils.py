@@ -7,7 +7,7 @@ from flax.core import FrozenDict
 from functools import partial
 from jax import lax, pmap
 from typing import Dict
-
+import jax_dataclasses as jdc
 
 LEROBOT_ROOT = lerobot.__path__[0]
 
@@ -60,11 +60,11 @@ def compute_normalization_stats(dataset, keys, n_devices, cache_filepath="normal
         data_sharded = shard_data(data, n_devices)
         global_count, global_total, global_min, global_max, global_total_sq = compute_global_stats(data_sharded)
         stats[key] = {
-            'count': global_count,
-            'total': global_total,
-            'min': global_min,
-            'max': global_max,
-            'total_sq': global_total_sq
+            'count': np.array(global_count.mean(axis=0)),
+            'total': np.array(global_total.mean(axis=0)),
+            'min': np.array(global_min.mean(axis=0)),
+            'max': np.array(global_max.mean(axis=0)),
+            'total_sq': np.array(global_total_sq.mean(axis=0))
         }
 
     if cache_filepath is not None:
@@ -83,7 +83,7 @@ def normalize_transform(batch: jnp.ndarray,
     Args:
         batch: Data to transform.
         stats: A dict containing normalization statistics (e.g. mean, std, min, max).
-        mode: The normalization mode. Must be one of "mean_std" or "min_max".
+        is_min_max: Whether to use min-max normalization.
         unnormalize: If True, perform the inverse transform.
 
     Returns:
@@ -100,12 +100,11 @@ def normalize_transform(batch: jnp.ndarray,
             return batch * (stats["std"] + 1e-8) + stats["mean"]
         else:
             return (batch - stats["mean"]) / (stats["std"] + 1e-8)
-    
 
 @partial(jax.jit, static_argnames=("normalization_stats", "normalization_modes"))
 def normalize_inputs(batch: Dict[str, jnp.ndarray],
-                     normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]],
-                     normalization_modes: FrozenDict[str, str]) -> Dict[str, jnp.ndarray]:
+                     normalization_stats: Dict[str, Dict[str, jnp.ndarray]],
+                     normalization_modes: Dict[str, str]) -> Dict[str, jnp.ndarray]:
     """
     Normalize a dictionary of inputs using the provided normalization statistics and modes.
 

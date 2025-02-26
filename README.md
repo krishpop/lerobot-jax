@@ -1,81 +1,126 @@
-# lerobot-jax
+# lerobot-jax: Policy Agnostic RL Framework
 
-lerobot-jax is a JAX-based library for training multi-task policies using a combination of offline RL and imitation learning techniques.
-It is designed to facilitate research and development in reinforcement learning and related fields.
+lerobot-jax is a JAX-based library for training multi-task policies using a Policy Agnostic RL (PA-RL) approach. The package provides modular components for reinforcement learning and imitation learning, with a focus on supporting diverse policy architectures such as diffusion models and autoregressive transformers.
+
+## Features
+
+- **Modular Design**: Compose agents from policies, critics, and replay buffers
+- **Policy Agnostic**: Support for multiple policy architectures (Gaussian, diffusion, autoregressive)
+- **Q-Learning**: Well-calibrated critics for evaluating and optimizing actions
+- **Flexible Training**: Support for offline RL, imitation learning, and online fine-tuning
+
+## Architecture
+
+The package is organized into several modular components:
+
+### Modules
+
+- `PAModule`: Base abstract class for all PA-RL components
+- `Agent`: Integrates policies and critics into a complete RL agent
+  - `ImitationAgent`: For imitation learning without rewards
+  - `ActorCriticAgent`: For methods that combine policy and value learning
+  - `OfflineRLAgent`: Specialized for offline RL with fixed datasets
+  - `DiffusionPolicyRLAgent`: Combines diffusion policies with RL critics
+
+### Models
+
+- `PolicyModel`: Base class for policy models
+  - `GaussianPolicy`: Classic Gaussian policies for simple RL algorithms
+  - `DiffusionPolicy`: Generates actions using denoising diffusion
+  - `AutoregressivePolicy`: Generates actions sequentially
+
+### Critics
+
+- `QCritic`: Base class for Q-function critics
+  - `EnsembleQCritic`: Uses multiple Q-networks to reduce overestimation bias
+  - `DistributionalQCritic`: Models the full distribution of returns
+
+### Replay Buffers
+
+- `ReplayBuffer`: For storing and sampling transitions
+- `OfflineDataset`: For working with pre-collected datasets
 
 ## Installation
 
 To install lerobot-jax, clone the repository and run:
+
 ```bash
 pip install -e .
-```
-
-When installing packages, you can install miniconda to setup a conda environment with all other dependencies:
-`curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh`
-`bash Miniconda3-latest-Linux-x86_64.sh`
-
-
-### Download lerobot, jaxrl_m, and related dependencies
-
-To setup `multi_task_experts`,
-`cd $HOME`
-`git clone --recursive --branch tdmpc-jax git@github.com:krishpop/multi_task_experts.git`
-
-To install `lerobot`
-```bash
-git clone https://github.com/huggingface/lerobot.git
-cd lerobot
-conda create -n lerobot python=3.10
-pip install -e .[pusht]
-```
-
-To install `d3il` environments
-```bash
-git clone https://github.com/ALRhub/d3il.git
-cd d3il/environments/d3il/envs/gym_stacking
-pip install -e .
-cd ../gym_sorting
-pip install -e .
-conda env config vars set PYTHONPATH=[D3IL INSTALL PATH]
-```
-
-To install `jaxrl_m`
-```bash
-git clone https://github.com/krishpop/jaxrl_m.git
-pip install -e .
-conda install -c conda-forge gin-config gym==0.21.0 -y
-conda install conda-forge::pinocchio
-pip install pybullet==3.2.6 --no-deps
-pip install mujoco==2.3.2
-```
-
-To install jax[tpu], flax, ml-collections, diffusers
-```bash
-pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install flax optax ml-collections diffusers distrax
-pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 -f https://storage.googleapis.com/libtpu-releases/index.html -f https://storage.googleapis.com/libtpu-wheels/index.html
-```
-
-To download pretrained encoders:
-```bash
-git clone git@github.com:krishpop/pretrained_vision.git
-python pretrained_vision/pretrained_vision/resnetv1.py \
-    --pretrained_path=imagenet --prefix=imagenet-resnetv1-18 \
-    --encoder resnetv1-18 --save_dir [jaxrl_m INSTALL PATH]/pretrained_encoders_new/
 ```
 
 ## Usage
 
-To use lerobot-jax, import the necessary modules and start training your models. Here is a basic example:
+### Creating an Agent
 
 ```python
-from lerobot_jax import diffusion_jax, tdmpc2_jax
+import lerobot_jax as ljx
+import jax
 
-# Initialize your model and start training
-model = diffusion_jax.create_simple_diffusion_learner(...)
-model.train(...)
+# Create a policy
+policy = ljx.create_policy_model(
+    policy_type="diffusion",
+    seed=0,
+    shape_meta=shape_meta,
+    config=policy_config,
+)
+
+# Create a critic
+critic = ljx.create_q_critic(
+    critic_type="ensemble",
+    seed=1,
+    shape_meta=shape_meta,
+    config=critic_config,
+)
+
+# Create an agent
+agent = ljx.create_agent(
+    agent_type="diffusion_rl",
+    policy=policy,
+    critic=critic,
+    seed=2,
+    config=agent_config,
+)
 ```
 
+### Training an Agent
+
+```python
+# Load a dataset
+dataset = ljx.OfflineDataset.load_from_path(
+    path="path/to/dataset",
+    normalize=True,
+    seed=3,
+)
+
+# Training loop
+for step in range(num_steps):
+    # Sample batch from dataset
+    dataset, batch = dataset.sample(batch_size)
+    
+    # Update agent
+    info = agent.update(batch)
+    
+    # Extract updated agent if returned in info
+    if "agent" in info:
+        agent = info["agent"]
+```
+
+### Generating Actions
+
+```python
+# Generate an action
+action = agent.act(
+    observations,
+    evaluation=True,
+    guidance_scale=2.0,
+)
+```
+
+## Examples
+
+See the `examples` directory for complete examples of different agents and training setups:
+
+- `diff_rl_example.py`: Combining a diffusion policy with a Q-critic for offline RL
 
 ## Contributing
 
@@ -83,4 +128,5 @@ Contributions are welcome! Please submit a pull request or open an issue to disc
 
 ## License
 
-This project is licensed under the Apache License 2.0. See the LICENSE file for details.
+This project is licensed under the Apache License 2.0. See the LICENSE file for details. 
+

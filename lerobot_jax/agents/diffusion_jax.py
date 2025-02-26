@@ -419,7 +419,9 @@ class SimpleDiffusionAgent(flax.struct.PyTreeNode):
             l2_loss = jnp.mean((noise - pred)**2)
             return l2_loss, {'diffusion_loss': l2_loss}
 
+        print("updating model")
         new_model, info = self.model.apply_loss_fn(loss_fn=loss_fn, has_aux=True, pmap_axis=pmap_axis)
+        print("updated model")
         return self.replace(model=new_model), info
 
     def update_eval_state(

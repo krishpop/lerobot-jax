@@ -1,7 +1,6 @@
 import collections
 import os
 import pickle
-from dataclasses import dataclass
 from functools import partial
 from typing import Dict
 
@@ -34,7 +33,7 @@ from lerobot_jax.utils.model_utils import (
     TrainState,
     WithMappedEncoders,
 )
-from lerobot_jax.utils.norm_utils import normalize_inputs, unnormalize_outputs
+from lerobot_jax.utils.norm_utils import normalize_transform
 
 # -------------
 # Config class
@@ -46,6 +45,9 @@ class TDMPC2Config:
     """
     Configuration for TDMPC2. Adjust or extend as necessary.
     """
+
+    normalization_stats: jdc.Static[FrozenDict[str, Dict[str, jnp.ndarray]]] = None
+    normalization_modes: jdc.Static[FrozenDict[str, str]] = None
 
     # Training
     lr: float = 3e-4
@@ -89,7 +91,7 @@ class TDMPC2Config:
     vmin: float = -10
     vmax: float = 10
     # For dynamic tasks
-    mpc: bool = True
+    mpc: bool = False
     episode_length: int = 200
     episode_lengths: Tuple[int, ...] = ()
     # Discount factor for weighting Q-values over the horizon
@@ -173,9 +175,9 @@ class WorldModel(nn.Module):
                 else:
                     encoder_defs[key] = img_encoder
             self.encoder = WithMappedEncoders(
-                encoders=encoder_defs,
+                encoders=frozen_dict.freeze(encoder_defs),
                 network=nn.Sequential([nn.Dense(self.cfg.latent_dim), nn.relu]),
-                concatenate_keys=list(self.cfg.input_shapes.keys()),
+                concatenate_keys=tuple(self.cfg.input_shapes.keys()),
             )
         else:
             if len(self.cfg.image_keys) > 0:
@@ -234,9 +236,7 @@ class WorldModel(nn.Module):
 
         return next_z
 
-    def get_task_embedding(
-        self, x: jnp.ndarray, task: Union[int, jnp.ndarray]
-    ) -> jnp.ndarray:
+    def get_task_embedding(self, x: Data, task: Union[int, jnp.ndarray]) -> Data:
         """
         Get task embedding and concatenate with input x.
         Args:
@@ -250,27 +250,32 @@ class WorldModel(nn.Module):
 
         # Convert task to array if needed
         if isinstance(task, int):
-            task = jnp.array([task])
+            task = jax.nn.one_hot(task, len(self.cfg.tasks))
 
         # Get embedding
         emb = self.task_emb(task)
 
         # Handle different input dimensions
-        if x.ndim == 5:  # [T, B, C, H, W] format
-            emb = jnp.reshape(emb, (1, emb.shape[0], 1, emb.shape[1], 1))
-            emb = jnp.tile(emb, (x.shape[0], 1, 1, 1, x.shape[-1]))
-        elif x.ndim == 4:  # [B, C, H, W] format
-            emb = jnp.reshape(emb, (emb.shape[0], 1, emb.shape[1], 1))
-            emb = jnp.tile(emb, (1, 1, 1, x.shape[-1]))
-        elif x.ndim == 3:  # [B, T, D] format
-            emb = jnp.expand_dims(emb, 0)
-            emb = jnp.tile(emb, (x.shape[0], 1, 1))
-        elif emb.shape[0] == 1:  # Single task case
-            emb = jnp.tile(emb, (x.shape[0], 1))
+        if isinstance(x, dict):
+            for key, value in x.items():
+                if value.ndim == 3:
+                    emb = jnp.expand_dims(emb, 0)
+                    emb = jnp.tile(emb, (value.shape[0], 1, 1))
+                elif emb.shape[0] == 1:  # Single task case
+                    emb = jnp.tile(emb, (value.shape[0], 1))
+                x[key] = jnp.concatenate([value, emb], axis=-1)
+        else:
+            if x.ndim == 3:  # [B, T, D] format
+                emb = jnp.expand_dims(emb, 0)
+                emb = jnp.tile(emb, (x.shape[0], 1, 1))
+            elif emb.shape[0] == 1:  # Single task case
+                emb = jnp.tile(emb, (x.shape[0], 1))
+            x = jnp.concatenate([x, emb], axis=-1)
+        return x
 
-        return jnp.concatenate([x, emb], axis=-1)
-
-    def encode(self, obs: jnp.ndarray, task: Optional[Union[int, jnp.ndarray]] = None) -> jnp.ndarray:
+    def encode(
+        self, obs: Data, task: Optional[Union[int, jnp.ndarray]] = None
+    ) -> jnp.ndarray:
         """
         Encode observations with optional task embedding.
         """
@@ -366,14 +371,14 @@ class TDMPC2Critic(Critic):
         return q  # shape [batch, num_bins]
 
 
-@dataclass
+@jdc.pytree_dataclass
 class AgentEvalState:
-    observation_queue: collections.deque = struct.field(
-        default_factory=lambda: collections.deque(maxlen=1)
-    )
-    action_queue: collections.deque = struct.field(
-        default_factory=lambda: collections.deque(maxlen=5)
-    )
+    """State maintained during evaluation."""
+
+    from collections import deque
+
+    observation_queue: deque = struct.field(default_factory=lambda: deque(maxlen=2))
+    action_queue: deque = struct.field(default_factory=lambda: deque(maxlen=5))
 
 
 # ----------------------------------------------------------------------------------------
@@ -486,8 +491,8 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
     critic: TrainState
     target_critic: TrainState
     cfg: TDMPC2Config
-    normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]] = None
-    normalization_modes: FrozenDict[str, str] = None
+    # normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]] = None
+    # normalization_modes: FrozenDict[str, str] = None
     eval_state: Optional[AgentEvalState] = None
     _use_image: bool = False
     _use_env_state: bool = False
@@ -515,8 +520,8 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
 
     def update_eval_state(
         self,
-        observations: Optional[Dict[str, jnp.ndarray]] = None,
-        actions: Optional[jnp.ndarray] = None,
+        observations: Optional[Dict[str, np.ndarray]] = None,
+        actions: Optional[np.ndarray] = None,
     ) -> "TDMPC2Agent":
         """Update observation and action queues in eval state."""
         if self.eval_state is None:
@@ -527,16 +532,24 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         if observations is not None:
             queue = new_state.observation_queue
             queue.append(observations)
+
+            # Pad queue with first observation if not full
+            while len(queue) < queue.maxlen:
+                queue.append(observations)
+
             new_state = self.eval_state.replace(observation_queue=queue)
 
         if actions is not None:
             queue = new_state.action_queue
-            if isinstance(actions, list):
-                queue.extend(actions)
-            else:
-                queue.append(actions)
-            new_state = self.eval_state.replace(action_queue=queue)
+            queue.extend(actions)
 
+            # Pad queue with first action if not full
+            if len(queue) < queue.maxlen:
+                first_action = queue[-1]
+                while len(queue) < queue.maxlen:
+                    queue.extend(first_action)
+
+            new_state = self.eval_state.replace(action_queue=queue)
         return self.replace(eval_state=new_state)
 
     def Qs(
@@ -606,9 +619,11 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
                 new_queues[key].append(batch[key])
         return new_queues
 
-    # @partial(jax.jit, static_argnums=(0,))
     def sample_actions(
-        agent, observations: Dict[str, jnp.ndarray], *, seed: PRNGKey = None
+        agent,
+        observations: Dict[str, jnp.ndarray],
+        *,
+        seed: PRNGKey = None,  # noqa: F405
     ) -> jnp.ndarray:
         """Select a single action given environment observations.
 
@@ -619,9 +634,33 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             Selected action as a JAX array.
         """
         rng = jax.random.PRNGKey(seed) if seed is not None else agent.model.key
-
         # Normalize inputs
-        batch = normalize_inputs(observations, agent.normalization_stats, agent.normalization_modes)
+        # We need to avoid passing JAX arrays as dict keys which causes unhashable errors
+        batch = dict(observations)  # Shallow copy to avoid modifying the original batch.
+        
+        # Convert normalization stats to Python primitives where needed
+        if agent.cfg.normalization_stats is not None and agent.cfg.normalization_modes is not None:
+            for key, value in observations.items():
+                # Skip keys not in our normalization stats
+                if key not in agent.cfg.normalization_stats or key not in agent.cfg.normalization_modes:
+                    continue
+                
+                # Get stats and mode as Python values, not JAX arrays
+                stats = dict(agent.cfg.normalization_stats[key])
+                mode = agent.cfg.normalization_modes[key]
+                
+                # Apply normalization directly with the normalize_transform function
+                if mode == "mean_std":
+                    mean = stats["mean"]
+                    std = stats["std"]
+                    batch[key] = (value - mean) / (std + 1e-8)
+                elif mode == "min_max":
+                    breakpoint()
+                    min_val = stats["min"]
+                    max_val = stats["max"]
+                    normalized = (value - min_val) / (max_val - min_val + 1e-8)
+                    batch[key] = normalized * 2.0 - 1.0
+
         if agent._use_image:
             batch = dict(batch)  # shallow copy
             batch["observation.image"] = batch[agent.input_image_key]
@@ -633,7 +672,9 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
         if len(agent.eval_state.action_queue) == 0:
             # Stack queue contents
             batch = {
-                key: jnp.stack(list(agent.eval_state.observation_queue[key]), axis=1)
+                key: jnp.stack(
+                    [obs[key] for obs in agent.eval_state.observation_queue], axis=1
+                )
                 for key in batch
             }
 
@@ -652,27 +693,26 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             encode_keys.append("observation.state")
 
             # Encode current observation
-            z = agent.model.encode({k: batch[k] for k in encode_keys})
+            z = agent.encode({k: batch[k] for k in encode_keys})
 
             # Get actions either through planning or direct policy
             if agent.cfg.mpc:
                 actions = agent.plan(z, rng)  # (horizon, batch, action_dim)
             else:
                 # Use policy directly - returns one action
-                actions = agent.pi(z, rng)[0].unsqueeze(0)
+                actions = agent.pi(z, rng)[0][None]
 
             # Clip actions to [-1, 1]
             actions = jnp.clip(actions, -1.0, 1.0)
 
             # Unnormalize actions
-            actions = unnormalize_outputs({"action": actions}, agent.normalization_stats, agent.normalization_modes)["action"]
+            actions = normalize_transform(actions, agent.cfg.normalization_stats["action"], agent.cfg.normalization_modes["action"], unnormalize=True)
 
             # Handle action repeats
             if agent.cfg.n_action_repeats > 1:
                 agent = agent.update_eval_state(
                     actions=[actions[0]] * agent.cfg.n_action_repeats
                 )
-
             else:
                 # Extend action queue with planned actions
                 for act in actions[: agent.cfg.n_action_steps]:
@@ -680,9 +720,10 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
 
         # Return next action from queue
         action = agent.eval_state.action_queue.popleft()
+        breakpoint()
         return action
 
-    def encode(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def encode(self, obs: Data) -> jnp.ndarray:
         return self.model.encode(obs)
 
     def next(self, z: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
@@ -694,7 +735,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
     def pi(
         self,
         z: jnp.ndarray,
-        rng: Optional[jax.random.PRNGKey] = None,
+        rng: Optional[jax.random.PRNGKey] = None,  # noqa: F405
         eval_mode: bool = False,
     ):
         if rng is None:
@@ -704,7 +745,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
 
     def plan(
         self,
-        obs: jnp.ndarray,
+        z: jnp.ndarray,
         rng: Optional[jax.random.PRNGKey] = None,
         eval_mode: bool = False,
     ):
@@ -716,7 +757,6 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             rng = self.model.key
 
         # Encode obs
-        z = self.encode(obs)
         horizon = self.cfg.horizon
         samples = self.cfg.num_samples
 
@@ -731,27 +771,13 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             maxval=1,
         )
 
-        # Evaluate
-        # We'll do a simple step-by-step rollout in latent space
-        def rollout_body(carry, t):
-            z_t = carry
-            # we have the index t, we want to retrieve the actions for time t
-            act_t = rand_actions[t]
-            z_next = self.next(jnp.expand_dims(z_t, 0).repeat(samples, axis=0), act_t)
-            # compute rewards
-            rew_logits = self.reward_fn(
-                jnp.expand_dims(z_t, 0).repeat(samples, axis=0), act_t
-            )
-            rew = two_hot_inv(rew_logits).squeeze(-1)
-            return (z_next), rew
-
         def scan_trajectory(z0):
             # z0 shape [latent_dim], we broadcast to [samples, latent_dim]
             z_samp = jnp.expand_dims(z0, 0).repeat(samples, axis=0)
             rews = []
             for tstep in range(horizon):
                 rew_logits = self.reward_fn(z_samp, rand_actions[tstep])
-                rew = two_hot_inv(rew_logits)
+                rew = two_hot_inv(rew_logits, self.cfg)
                 rews.append(rew)
                 z_samp = self.next(z_samp, rand_actions[tstep])
             # approximate value by final Q
@@ -762,7 +788,7 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             )  # zero act
             # shape [num_q, batch, 5]
             final_q_values = jnp.mean(final_q_logits, axis=0)
-            final_val = two_hot_inv(final_q_values)
+            final_val = two_hot_inv(final_q_values, self.cfg)
             # sum up rewards
             total_rew = jnp.sum(jnp.concatenate(rews, axis=-1), axis=-1, keepdims=True)
             return total_rew + final_val
@@ -1041,16 +1067,16 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             return total_loss_with_pi.mean(), losses_dict
 
         # Update world model, policy, and critic parameters
-        print("about to update model")
+        # print("about to update model")
         new_model, info_dict = agent.model.apply_loss_fn(
             loss_fn=update_model, has_aux=True, pmap_axis=pmap_axis
         )
-        print("about to update critic")
+        # print("about to update critic")
         new_critic, critic_info = agent.critic.apply_loss_fn(
             loss_fn=update_critic, has_aux=True, pmap_axis=pmap_axis
         )
-        print("info_dict keys", info_dict.keys())
-        print("critic_info keys", critic_info.keys())
+        # print("info_dict keys", info_dict.keys())
+        # print("critic_info keys", critic_info.keys())
         info = {}
         for k in info_dict.keys():
             if isinstance(info_dict[k], jnp.ndarray):
@@ -1106,16 +1132,12 @@ def create_q_ensemble(cfg):
 def create_tdmpc2_learner(
     config: TDMPC2Config,
     rng: jax.random.PRNGKey,
-    normalization_stats: Dict = None,
-    normalization_modes: Dict = None,
     shape_meta: Dict = None,
     **kwargs,
 ) -> TDMPC2Agent:
     """Create a TDMPC2 agent with proper initialization."""
 
     # jax.tree_util.register_dataclass(TDMPC2Config)
-    normalization_stats = frozen_dict.freeze(normalization_stats)
-    normalization_modes = frozen_dict.freeze(normalization_modes)
     input_shapes = shape_meta["input_shapes"]
 
     # Create zero tensors for inputs
@@ -1158,7 +1180,7 @@ def create_tdmpc2_learner(
     )
 
     # Determine observation types
-    use_image = config.obs == "rgb"
+    use_image = len(config.image_keys) > 0
     use_env_state = "observation.environment_state" in config.input_shapes
     input_image_key = None
     if use_image:
@@ -1178,12 +1200,8 @@ def create_tdmpc2_learner(
         _use_image=use_image,
         _use_env_state=use_env_state,
         input_image_key=input_image_key,
-        normalization_stats=normalization_stats,
-        normalization_modes=normalization_modes,
+        # eval_state=AgentEvalState.init_eval_state(config, use_image, use_env_state),
     )
-
-    # Initialize queues
-    agent = agent.init_eval_state()
 
     return agent
 
@@ -1235,7 +1253,7 @@ def main(_):
 
     # Initialize agent
     rng = jax.random.PRNGKey(FLAGS.seed)
-    agent = create_tdmpc2_learner(FLAGS.config, rng, dataset)
+    agent = create_tdmpc2_learner(FLAGS.config, rng, shape_meta=dataset.shape_meta)
 
     # Training loop
     for i in tqdm.tqdm(

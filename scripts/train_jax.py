@@ -174,6 +174,8 @@ def main(_):
 
     normalization_modes = {k: lerobot_cfg.policy.input_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.input_shapes.keys()}
     normalization_modes.update({k: lerobot_cfg.policy.output_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.output_shapes.keys()})
+    normalization_modes = frozen_dict.freeze(normalization_modes)
+    normalization_stats = frozen_dict.freeze(normalization_stats)
 
     input_shapes = OmegaConf.to_container(lerobot_cfg.policy.input_shapes, resolve=True)
     output_shapes = OmegaConf.to_container(lerobot_cfg.policy.output_shapes, resolve=True)
@@ -213,10 +215,13 @@ def main(_):
         lerobot_cfg = TDMPC2Config(**algo_cfg)
         with jdc.copy_and_mutate(lerobot_cfg, validate=False) as lerobot_cfg:
             lerobot_cfg.action_dim = env.action_space.shape[-1]
-            lerobot_cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
+            lerobot_cfg.image_keys = tuple(list(filter(lambda x: x.startswith('observation.image'), input_shapes.keys())))
             lerobot_cfg.input_shapes = input_shapes
             lerobot_cfg.output_shapes = output_shapes
-        agent = create_tdmpc2_learner(lerobot_cfg, rng, normalization_stats, normalization_modes, shape_meta)
+            lerobot_cfg.normalization_stats = normalization_stats
+            lerobot_cfg.normalization_modes = normalization_modes
+
+        agent = create_tdmpc2_learner(lerobot_cfg, rng, shape_meta)
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
 
@@ -230,7 +235,7 @@ def main(_):
             config=algo_cfg
         )
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
-        sample_actions = agent.sample_actions
+        sample_actions = lambda x: agent.sample_actions(x, output_shape=output_shapes[output_key])  # noqa: E731
     elif FLAGS.algo == 'ric':
         encoder_def = create_input_encoder(input_keys) 
         agent = create_ric_diffusion_learner(
@@ -250,7 +255,7 @@ def main(_):
         mesh = MeshShardingHelper([FLAGS.num_devices], ["fsdp"])
 
         update_fn = functools.partial(mesh.sjit, in_shardings=[FSDPShardingRule(fsdp_axis_name="fsdp")])(update_fn)
-        sample_actions = mesh.sjit(sample_actions)
+        # sample_actions = functools.partial(mesh.sjit, in_shardings=[FSDPShardingRule(fsdp_axis_name="fsdp")])(sample_actions)
 
     else:
         update_fn = jax.jit(update_fn)
