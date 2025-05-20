@@ -54,15 +54,17 @@ def compute_normalization_stats(dataset, keys, n_devices, cache_filepath="normal
 
     stats = {}
     for key in keys:
+        if len(dataset.features[key].shape) == 1:
+            continue
         data = dataset[key]
         data_sharded = shard_data(data, n_devices)
         global_count, global_total, global_min, global_max, global_total_sq = compute_global_stats(data_sharded)
         stats[key] = {
-            'global_count': global_count,
-            'global_total': global_total,
-            'global_min': global_min,
-            'global_max': global_max,
-            'global_total_sq': global_total_sq
+            'count': global_count,
+            'total': global_total,
+            'min': global_min,
+            'max': global_max,
+            'total_sq': global_total_sq
         }
 
     if cache_filepath is not None:
@@ -70,10 +72,10 @@ def compute_normalization_stats(dataset, keys, n_devices, cache_filepath="normal
     return stats
 
 
-@partial(jax.jit, static_argnames=("mode",))
+@partial(jax.jit, static_argnames=("is_min_max",))
 def normalize_transform(batch: jnp.ndarray,
                         stats: Dict[str, jnp.ndarray],
-                        mode: str,
+                        is_min_max: bool,
                         unnormalize: bool = False) -> jnp.ndarray:
     """
     Normalize (or unnormalize) a batch of data based on the provided statistics.
@@ -87,19 +89,18 @@ def normalize_transform(batch: jnp.ndarray,
     Returns:
         The transformed array.
     """
-    if mode == "mean_std":
-        if unnormalize:
-            return batch * (stats["std"] + 1e-8) + stats["mean"]
-        else:
-            return (batch - stats["mean"]) / (stats["std"] + 1e-8)
-    elif mode == "min_max":
+    if is_min_max:
         if unnormalize:
             return batch * (stats["max"] - stats["min"] + 1e-8) + stats["min"]
         else:
             normalized = (batch - stats["min"]) / (stats["max"] - stats["min"] + 1e-8)
             return normalized * 2.0 - 1.0
     else:
-        raise ValueError(f"Unsupported normalization mode: {mode}")
+        if unnormalize:
+            return batch * (stats["std"] + 1e-8) + stats["mean"]
+        else:
+            return (batch - stats["mean"]) / (stats["std"] + 1e-8)
+    
 
 @partial(jax.jit, static_argnames=("normalization_stats", "normalization_modes"))
 def normalize_inputs(batch: Dict[str, jnp.ndarray],
@@ -121,13 +122,14 @@ def normalize_inputs(batch: Dict[str, jnp.ndarray],
         if key not in normalization_stats or key not in normalization_modes:
             continue
         stats = normalization_stats[key]
-        mode = normalization_modes[key]
-        new_batch[key] = normalize_transform(value, stats, mode)
+        is_min_max = normalization_modes[key]
+        new_batch[key] = normalize_transform(value, stats, is_min_max)
     return new_batch
 
+@partial(jax.jit, static_argnames=("normalization_stats", "normalization_modes"))
 def unnormalize_outputs(batch: Dict[str, jnp.ndarray],
-                        normalization_stats: Dict[str, Dict[str, jnp.ndarray]],
-                        normalization_modes: Dict[str, str]) -> Dict[str, jnp.ndarray]:
+                        normalization_stats: FrozenDict[str, Dict[str, jnp.ndarray]],
+                        normalization_modes: FrozenDict[str, str]) -> Dict[str, jnp.ndarray]:
     """
     Unnormalize a dictionary of outputs back to the original scale using the provided stats.
 
@@ -144,7 +146,7 @@ def unnormalize_outputs(batch: Dict[str, jnp.ndarray],
         if key not in normalization_stats or key not in normalization_modes:
             continue
         stats = normalization_stats[key]
-        mode = normalization_modes[key]
-        new_batch[key] = normalize_transform(value, stats, mode, unnormalize=True)
+        is_min_max = normalization_modes[key]
+        new_batch[key] = normalize_transform(value, stats, is_min_max, unnormalize=True)
     return new_batch
     

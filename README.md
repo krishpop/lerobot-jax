@@ -1,6 +1,6 @@
 # lerobot-jax
 
-lerobot-jax is a JAX-based library for training multi-task policies using a combination of offline RL and imitation learning techniques. 
+lerobot-jax is a JAX-based library for training multi-task policies using a combination of offline RL and imitation learning techniques.
 It is designed to facilitate research and development in reinforcement learning and related fields.
 
 ## Installation
@@ -58,7 +58,6 @@ pip install torch~=2.5.0 torch_xla[tpu]~=2.5.0 -f https://storage.googleapis.com
 
 To download pretrained encoders:
 ```bash
-cd $HOME
 git clone git@github.com:krishpop/pretrained_vision.git
 python pretrained_vision/pretrained_vision/resnetv1.py \
     --pretrained_path=imagenet --prefix=imagenet-resnetv1-18 \
@@ -84,5 +83,4 @@ Contributions are welcome! Please submit a pull request or open an issue to disc
 
 ## License
 
-This project is licensed under the Apache License 2.0. See the LICENSE file for details. 
-
+This project is licensed under the Apache License 2.0. See the LICENSE file for details.

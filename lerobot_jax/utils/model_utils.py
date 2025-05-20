@@ -129,7 +129,7 @@ class ConcatenateWithEncoders(nn.Module):
 
 class WithMappedEncoders(nn.Module):
     encoders: Dict[str, nn.Module]
-    concatenate_keys: Tuple[str] = None
+    concatenate_keys: Tuple[str, ...] = None
     network: Optional[nn.Module] = None
 
     @nn.compact

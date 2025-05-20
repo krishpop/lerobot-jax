@@ -71,15 +71,15 @@ config_flags.DEFINE_config_dict('ric', ric_config, lock_config=False)
 tdmpc2_config = TDMPC2Config()
 config_flags.DEFINE_config_dict('tdmpc2', ConfigDict(asdict(tdmpc2_config)), lock_config=False)
 
-def load_dataset_and_env(dataset_name, config, return_config=False):
+def load_dataset_and_env(dataset_name, algo_cfg):
     # Parse config overrides if provided
     overrides = FLAGS.config_overrides.split(',') if FLAGS.config_overrides else []
-    if hasattr(config, 'num_obs_steps'):
-        overrides.append(f'policy.n_obs_steps={config.num_obs_steps}')
-    if hasattr(config, 'num_action_steps'):
-        overrides.append(f'policy.n_action_steps={config.num_action_steps}')
-    if hasattr(config, 'horizon'):
-        overrides.append(f'policy.horizon={config.horizon}')
+    if hasattr(algo_cfg, 'num_obs_steps'):
+        overrides.append(f'policy.n_obs_steps={algo_cfg.num_obs_steps}')
+    if hasattr(algo_cfg, 'num_action_steps'):
+        overrides.append(f'policy.n_action_steps={algo_cfg.num_action_steps}')
+    if hasattr(algo_cfg, 'horizon'):
+        overrides.append(f'policy.horizon={algo_cfg.horizon}')
 
     algo = FLAGS.algo
     if FLAGS.algo == 'ric':
@@ -120,24 +120,21 @@ def load_dataset_and_env(dataset_name, config, return_config=False):
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
     
-    if return_config:
-        return env, dataset, cfg
-    else:
-        return env, dataset
+    return env, dataset, cfg
 
 
 def main(_):
     if FLAGS.algo == 'tdmpc2':
-        config = FLAGS.tdmpc2
+        algo_cfg = FLAGS.tdmpc2
     elif FLAGS.algo == 'diffusion':
-        config = FLAGS.diffusion
+        algo_cfg = FLAGS.diffusion
     elif FLAGS.algo == 'ric':
-        config = FLAGS.ric
+        algo_cfg = FLAGS.ric
     else:
         raise ValueError(f"Unsupported algorithm: {FLAGS.algo}")
 
     # Create wandb logger
-    setup_wandb(config.to_dict(), **FLAGS.wandb)
+    setup_wandb(algo_cfg.to_dict(), **FLAGS.wandb)
     # Update config with subset of FLAGS
     wandb.config.update({
         'algo': FLAGS.algo,
@@ -163,20 +160,23 @@ def main(_):
             pickle.dump(get_flag_dict(), f)
 
     # Load dataset
-    env, dataset, cfg = load_dataset_and_env(FLAGS.dataset, config, return_config=True)
+    env, dataset, lerobot_cfg = load_dataset_and_env(FLAGS.dataset, algo_cfg)
 
     cache_filepath = f"{FLAGS.dataset}_normalization_stats.npy"
     hf_dataset = dataset.hf_dataset.with_format("jax")
-    filter_keys = list(cfg.policy.input_shapes.keys()) + list(cfg.policy.output_shapes.keys())
+    filter_keys = list(lerobot_cfg.policy.input_shapes.keys()) + list(lerobot_cfg.policy.output_shapes.keys())
     if FLAGS.algo == 'tdmpc2':
         filter_keys = filter_keys + ['next.reward']
     hf_dataset = hf_dataset.select_columns(filter_keys)
-    normalization_stats = compute_normalization_stats(hf_dataset, filter_keys, FLAGS.num_devices, cache_filepath).item()
-    normalization_modes = {k: cfg.policy.input_normalization_modes[k] for k in cfg.policy.input_shapes.keys()}
-    normalization_modes.update({k: cfg.policy.output_normalization_modes[k] for k in cfg.policy.output_shapes.keys()})
+    normalization_stats = compute_normalization_stats(hf_dataset, filter_keys, FLAGS.num_devices, cache_filepath)
+    if not isinstance(normalization_stats, dict):
+        normalization_stats = normalization_stats.item()
 
-    input_shapes = OmegaConf.to_container(cfg.policy.input_shapes, resolve=True)
-    output_shapes = OmegaConf.to_container(cfg.policy.output_shapes, resolve=True)
+    normalization_modes = {k: lerobot_cfg.policy.input_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.input_shapes.keys()}
+    normalization_modes.update({k: lerobot_cfg.policy.output_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.output_shapes.keys()})
+
+    input_shapes = OmegaConf.to_container(lerobot_cfg.policy.input_shapes, resolve=True)
+    output_shapes = OmegaConf.to_container(lerobot_cfg.policy.output_shapes, resolve=True)
 
     # Create numpy dataloader
     train_loader = DataLoader(
@@ -210,13 +210,13 @@ def main(_):
 
     if FLAGS.algo == 'tdmpc2':
         # Update config with shapes from environment
-        cfg = TDMPC2Config(**config)
-        with jdc.copy_and_mutate(cfg, validate=False) as cfg:
-            cfg.action_dim = env.action_space.shape[-1]
-            cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
-            cfg.input_shapes = input_shapes
-            cfg.output_shapes = output_shapes
-        agent = create_tdmpc2_learner(cfg, rng, normalization_stats, normalization_modes, shape_meta)
+        lerobot_cfg = TDMPC2Config(**algo_cfg)
+        with jdc.copy_and_mutate(lerobot_cfg, validate=False) as lerobot_cfg:
+            lerobot_cfg.action_dim = env.action_space.shape[-1]
+            lerobot_cfg.obs = 'rgb' if any(k.startswith('observation.image') for k in input_shapes) else 'state'
+            lerobot_cfg.input_shapes = input_shapes
+            lerobot_cfg.output_shapes = output_shapes
+        agent = create_tdmpc2_learner(lerobot_cfg, rng, normalization_stats, normalization_modes, shape_meta)
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
 
@@ -227,7 +227,7 @@ def main(_):
             shape_meta=shape_meta,
             output_key=output_key,
             encoder_def=encoder_def,
-            config=config
+            config=algo_cfg
         )
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
@@ -238,7 +238,7 @@ def main(_):
             shape_meta=shape_meta,
             output_key=output_key,
             encoder_def=encoder_def,
-            config=config
+            config=algo_cfg
         )
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
@@ -268,7 +268,6 @@ def main(_):
             batch = get_batch(train_iter)
 
         # Update step
-        breakpoint()
         agent, metrics = update_fn(batch)
 
         if i % FLAGS.eval_interval == 0 or i == 1:
