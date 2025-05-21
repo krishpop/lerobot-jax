@@ -33,7 +33,7 @@ from lerobot_jax.agents.diffusion_jax import (
     create_simple_diffusion_learner,
     get_default_config,
 )
-from lerobot_jax.agents.tdmpc2_jax import TDMPC2Agent, TDMPC2Config, create_tdmpc2_learner
+from lerobot_jax.agents.tdmpc2_jax_v1 import TDMPC2Agent, TDMPC2Config, create_tdmpc2_learner
 from lerobot_jax.utils.norm_utils import LEROBOT_ROOT, compute_normalization_stats
 
 FLAGS = flags.FLAGS
@@ -172,10 +172,36 @@ def main(_):
     if not isinstance(normalization_stats, dict):
         normalization_stats = normalization_stats.item()
 
-    normalization_modes = {k: lerobot_cfg.policy.input_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.input_shapes.keys()}
-    normalization_modes.update({k: lerobot_cfg.policy.output_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.output_shapes.keys()})
-    normalization_modes = frozen_dict.freeze(normalization_modes)
-    normalization_stats = frozen_dict.freeze(normalization_stats)
+    print(f"DEBUG: lerobot_cfg.policy keys: {dir(lerobot_cfg.policy)}")
+    print(f"DEBUG: lerobot_cfg.policy.input_shapes: {lerobot_cfg.policy.input_shapes}")
+    
+    try:
+        print(f"DEBUG: lerobot_cfg.policy.input_normalization_modes: {lerobot_cfg.policy.input_normalization_modes}")
+        normalization_modes = {k: lerobot_cfg.policy.input_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.input_shapes.keys()}
+        print(f"DEBUG: normalization_modes after input processing: {normalization_modes}")
+        
+        print(f"DEBUG: lerobot_cfg.policy.output_normalization_modes: {lerobot_cfg.policy.output_normalization_modes}")
+        print(f"DEBUG: lerobot_cfg.policy.output_shapes: {lerobot_cfg.policy.output_shapes}")
+        normalization_modes.update({k: lerobot_cfg.policy.output_normalization_modes[k] == "min_max" for k in lerobot_cfg.policy.output_shapes.keys()})
+        print(f"DEBUG: normalization_modes after output processing: {normalization_modes}")
+        
+        normalization_modes = frozen_dict.freeze(normalization_modes)
+        normalization_stats = frozen_dict.freeze(normalization_stats)
+    except Exception as e:
+        print(f"DEBUG: Exception in normalization_modes creation: {e}")
+        print(f"DEBUG: Exception type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        # Create fallback normalization_modes if there was an issue
+        print("Creating fallback normalization_modes using 'mean_std' for all keys")
+        input_keys = lerobot_cfg.policy.input_shapes.keys()
+        output_keys = lerobot_cfg.policy.output_shapes.keys()
+        normalization_modes = {k: False for k in input_keys}  # False means 'mean_std'
+        normalization_modes.update({k: False for k in output_keys})  # False means 'mean_std'
+        
+        normalization_modes = frozen_dict.freeze(normalization_modes)
+        normalization_stats = frozen_dict.freeze(normalization_stats)
 
     input_shapes = OmegaConf.to_container(lerobot_cfg.policy.input_shapes, resolve=True)
     output_shapes = OmegaConf.to_container(lerobot_cfg.policy.output_shapes, resolve=True)
@@ -220,8 +246,23 @@ def main(_):
             lerobot_cfg.output_shapes = output_shapes
             lerobot_cfg.normalization_stats = normalization_stats
             lerobot_cfg.normalization_modes = normalization_modes
+            
+        # Debug the parameters being passed to create_tdmpc2_learner
+        print(f"DEBUG: shape_meta: {shape_meta}")
+        print(f"DEBUG: lerobot_cfg.normalization_modes: {lerobot_cfg.normalization_modes}")
+        print(f"DEBUG: lerobot_cfg.normalization_stats keys: {lerobot_cfg.normalization_stats.keys() if lerobot_cfg.normalization_stats is not None else None}")
 
-        agent = create_tdmpc2_learner(lerobot_cfg, rng, shape_meta)
+        # Make sure normalization_modes is not None before passing it
+        norm_modes = lerobot_cfg.normalization_modes if hasattr(lerobot_cfg, 'normalization_modes') and lerobot_cfg.normalization_modes is not None else frozen_dict.freeze({})
+        norm_stats = lerobot_cfg.normalization_stats if hasattr(lerobot_cfg, 'normalization_stats') and lerobot_cfg.normalization_stats is not None else frozen_dict.freeze({})
+        
+        agent = create_tdmpc2_learner(
+            lerobot_cfg, 
+            rng, 
+            normalization_stats=norm_stats, 
+            normalization_modes=norm_modes, 
+            shape_meta=shape_meta
+        )
         update_fn = functools.partial(agent.update)  #, pmap_axis="i" if FLAGS.num_devices > 1 else None)
         sample_actions = agent.sample_actions
 

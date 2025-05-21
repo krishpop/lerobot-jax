@@ -105,6 +105,12 @@ class TDMPC2Config:
     action_dims: Tuple[int, ...] = ()  # Action dimensions for each task
     n_action_steps: int = 5
     n_action_repeats: int = 1
+    # TD-M(PC)^2 specific
+    use_policy_constraint: bool = False  # Flag to enable TD-M(PC)^2 policy regularization
+    prior_constraint_coef: float = 1.0  # Beta: Strength of the policy regularization term
+    adaptive_regularization: bool = False # Flag to enable adaptive curriculum for beta
+    scale_threshold: float = 2.0  # s_threshold: Q-function percentile threshold for adaptive beta
+
 
     @property
     def bin_size(self) -> float:
@@ -880,34 +886,57 @@ class TDMPC2Agent(flax.struct.PyTreeNode):
             discount = agent.cfg.discount
             return rew_val + discount * v_next
 
-        def policy_loss(zs, task):
-            """
-            Update policy using the latent states. Typically, TDMPC2 might do a
-            model-based approach or a direct actor update. This version, for demonstration,
-            uses discrete Q distribution methods from TDMPC2 logic.
-            """
-            # Sample actions from current policy
-            pi_batched = jax.vmap(agent.model.pi, in_axes=(0, None, 0))
-            sampled_actions, info = pi_batched(zs, agent.model.key, task)
-            # print("zs.shape", zs.shape)
-            # print("sampled_actions.shape", sampled_actions.shape)
-
-            # Extract entropy from the policy output info
-            entropy = info.get("scaled_entropy", 0.0)
-            # print("entropy.shape", entropy.shape)
-
-            # Evaluate Q
-            q_vals = agent.Qs(
-                zs, sampled_actions, task=task, return_type="avg", detach=True
-            )  # [B, 1]
-
-            # Calculate policy loss with entropy term
-            rho = jnp.power(
-                agent.cfg.rho, jnp.arange(q_vals.shape[1], dtype=jnp.float32)[None]
+        def policy_loss(params, zs, actions_from_buffer, behavior_mean, behavior_log_std, task): # Added behavior_mean, behavior_log_std
+            # Sample actions a_pi ~ π(.|zs)
+            sampled_actions, pi_info = agent.model.apply_fn(
+                {'params': params}, zs, agent.model.key, task=task, eval_mode=False, method=WorldModel.pi
             )
-            pi_loss = -jnp.mean(agent.cfg.entropy_coef * entropy + q_vals * rho)
+            
+            log_prob_pi = -pi_info.get("entropy") # entropy is -log_prob.sum(), so -entropy is log_prob.sum()
+
+            # Q-values for these actions
+            q_values_for_sampled_actions = agent.Qs(
+                zs, sampled_actions, task=task, return_type="avg", detach=True # Detach Qs from policy gradient
+            )
+            q_values_for_sampled_actions = q_values_for_sampled_actions.squeeze(-1)
+
+            sampled_actions_pre_squash = jnp.arctanh(jnp.clip(sampled_actions, -1+1e-6, 1-1e-6))
+            
+            # Noise term for μ
+            noise_for_mu = (sampled_actions_pre_squash - behavior_mean) / (jnp.exp(behavior_log_std) + 1e-6)
+            
+            # Log prob of raw actions under μ's Gaussian
+            log_prob_mu_raw = gaussian_logprob(noise_for_mu, behavior_log_std) # This is sum over action dim
+            
+            # Squashing correction for μ (using sampled_actions which are already squashed)
+            squash_correction_mu = jnp.log(jnp.maximum(1 - sampled_actions**2, 1e-6)).sum(axis=-1, keepdims=True)
+            log_prob_mu = log_prob_mu_raw - squash_correction_mu
+
+            # Adaptive beta
+            current_beta = agent.cfg.prior_constraint_coef
+            if agent.cfg.adaptive_regularization:
+                # This needs access to Q-value statistics, placeholder for now
+                # q_percentile = ... (compute moving percentile of Q values from critic updates)
+                # if q_percentile < agent.cfg.scale_threshold:
+                #     current_beta = 0.0
+                # This logic might be better placed in the main update loop and beta passed to policy_loss
+                pass
+
+
+            # TD-M(PC)^2 Policy Loss (Equation 10 from paper [cite: 119])
+            # L = E [ Q(s,a) - alpha * log pi(a|s) + beta * log mu(a|s) ]
+            # We want to MAXIMIZE this, so for gradient ASCENT, the loss is -L
+            # Or for gradient DESCENT, the loss is L_pi = E [ -Q + alpha*log pi - beta*log mu ]
+            
+            pi_loss = - (
+                q_values_for_sampled_actions # Q(s, a_pi)
+                - agent.cfg.entropy_coef * log_prob_pi.squeeze(-1) # alpha * log pi(a_pi|s)
+                + current_beta * log_prob_mu.squeeze(-1) # beta * log mu(a_pi|s)
+            )
+            pi_loss = jnp.mean(pi_loss)
 
             return pi_loss
+
 
         # ----------------------------------------------------
         # 3) Perform a multi-step latent rollout for consistency and gather states.

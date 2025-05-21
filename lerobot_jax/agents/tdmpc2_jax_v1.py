@@ -22,7 +22,7 @@ from flax.training import checkpoints
 from jaxrl_m.common import target_update
 from jaxrl_m.evaluation import evaluate
 from jaxrl_m.networks import Critic, ensemblize
-from jaxrl_m.typing import InfoDict, PRNGKey, Batch, Array
+from jaxrl_m.typing import InfoDict, PRNGKey, Batch, Array, Data
 from jaxrl_m.vision.preprocess import PreprocessEncoder
 from jaxrl_m.wandb import default_wandb_config, get_flag_dict, setup_wandb
 from ml_collections import ConfigDict, config_flags
@@ -243,12 +243,24 @@ class WorldModel(nn.Module):
                         if obs_array.ndim > 1 and obs_array.shape[1] > 1:
                             # Get indices for all but the last element
                             time_indices = jnp.arange(obs_array.shape[1] - 1)
-                            # Reshape for broadcasting
-                            time_indices = time_indices.reshape(1, -1)
-                            # Select using take_along_axis which is safer
-                            x[k] = jnp.take_along_axis(
-                                obs_array, time_indices, axis=1
-                            )
+                            # Reshape for broadcasting - add extra dimensions to match obs_array
+                            if obs_array.ndim == 3:  # batch, time, features
+                                # Expand time_indices to match 3D array
+                                # [1, time] -> [batch, time, 1] to match [batch, time, features]
+                                batch_size = obs_array.shape[0]
+                                feature_dim = obs_array.shape[2]
+                                expanded_indices = time_indices.reshape(1, -1, 1)
+                                expanded_indices = jnp.broadcast_to(expanded_indices, (batch_size, time_indices.shape[1], 1))
+                                
+                                # Need to create indices for all three dimensions
+                                batch_indices = jnp.arange(batch_size).reshape(batch_size, 1, 1)
+                                batch_indices = jnp.broadcast_to(batch_indices, (batch_size, time_indices.shape[1], 1))
+                                
+                                # Just select the elements along time dimension
+                                x[k] = obs_array[:, :-1]
+                            else:
+                                # Original approach for 2D tensors
+                                x[k] = jnp.take_along_axis(obs_array, time_indices, axis=1)
                         else:
                             # Just copy if no time dimension to slice
                             x[k] = obs_array
@@ -1399,19 +1411,52 @@ def create_tdmpc2_learner(
 ) -> TDMPC2Agent:
     """Create a TDMPC2 agent with proper initialization."""
 
+    # Debug the input parameters
+    print(f"DEBUG create_tdmpc2_learner: normalization_stats type: {type(normalization_stats)}")
+    print(f"DEBUG create_tdmpc2_learner: normalization_modes type: {type(normalization_modes)}")
+    print(f"DEBUG create_tdmpc2_learner: shape_meta type: {type(shape_meta)}")
+    
+    # Ensure normalization_modes is a dictionary before freezing
+    if normalization_modes is None:
+        print("DEBUG create_tdmpc2_learner: normalization_modes is None, creating empty dict")
+        normalization_modes = {}
+    
     # jax.tree_util.register_dataclass(TDMPC2Config)
     normalization_stats = frozen_dict.freeze(normalization_stats)
     normalization_modes = frozen_dict.freeze(normalization_modes)
+    print(f"DEBUG create_tdmpc2_learner: After freezing - normalization_modes: {normalization_modes}")
     input_shapes = shape_meta["input_shapes"]
 
-    # Create zero tensors for inputs
-    batch_obs = {key: jnp.zeros(shape) for key, shape in input_shapes.items()}
-    batch_obs.update(
-        {
-            k: jnp.zeros(shape_meta["output_shape"][k])
-            for k in shape_meta["output_shape"]
-        }
-    )
+    # Create zero tensors for inputs - ensure consistent dimensions
+    batch_obs = {}
+    print(f"DEBUG create_tdmpc2_learner: input_shapes = {input_shapes}")
+    
+    for key, shape in input_shapes.items():
+        # Ensure each observation has at least 3 dimensions (batch, time, features)
+        if len(shape) == 2:  # If only (batch, features)
+            # Add a time dimension
+            batch_obs[key] = jnp.zeros((shape[0], 2, shape[1]))  # Add time dim with 2 timesteps
+            print(f"DEBUG create_tdmpc2_learner: Expanded {key} from {shape} to {batch_obs[key].shape}")
+        else:
+            batch_obs[key] = jnp.zeros(shape)
+    
+    print(f"DEBUG create_tdmpc2_learner: batch_obs shapes after input creation:")
+    for k, v in batch_obs.items():
+        print(f"DEBUG create_tdmpc2_learner:   {k}: shape={v.shape}, ndim={v.ndim}")
+    
+    # Handle output shapes - ensure action has correct dimensions too
+    for k in shape_meta["output_shape"]:
+        out_shape = shape_meta["output_shape"][k]
+        if len(out_shape) == 2:  # If only (batch, action_dim)
+            # Add a time dimension for actions too
+            batch_obs[k] = jnp.zeros((out_shape[0], 2, out_shape[1]))
+            print(f"DEBUG create_tdmpc2_learner: Expanded {k} from {out_shape} to {batch_obs[k].shape}")
+        else:
+            batch_obs[k] = jnp.zeros(out_shape)
+    
+    print(f"DEBUG create_tdmpc2_learner: batch_obs shapes after output update:")
+    for k, v in batch_obs.items():
+        print(f"DEBUG create_tdmpc2_learner:   {k}: shape={v.shape}, ndim={v.ndim}")
 
     # Initialize model
     rng, dropout_key1, dropout_key2 = jax.random.split(rng, 3)
@@ -1438,6 +1483,10 @@ def create_tdmpc2_learner(
     rng, model_rng, sample_rng = jax.random.split(rng, 3)
     model_def = WorldModel(config)
     rngs = {"params": model_rng, "sample_actions": sample_rng}
+    # Initialize the model without try/catch now that we've fixed the dimensions
+    print(f"DEBUG create_tdmpc2_learner: About to initialize model with batch_obs shapes:")
+    for k, v in batch_obs.items():
+        print(f"DEBUG create_tdmpc2_learner:   {k}: shape={v.shape}, ndim={v.ndim}")
     params = model_def.init(rngs, batch_obs)["params"]
     model = TrainState.create(
         model_def,
