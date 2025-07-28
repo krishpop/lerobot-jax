@@ -1,0 +1,4 @@
+jax_dataclasses==1.6.2
+scalax==0.2.5
+sapien==3.0.0
+mani_skill==3.0.0b21
